@@ -9,7 +9,7 @@ from sky_lib.config import Config, CONFIGTYPE
 from socket import socket as _socket, AF_INET, AF_INET6, SOCK_STREAM
 from base64 import b64decode as _b64de, b64encode as _b64en
 from multiprocessing import Process, Queue
-from threading import Thread
+from threading import Thread as _Thread, Lock as _Lock
 from queue import Empty, Queue as ThreadQueue
 
 SERVING_SIDE = _Literal['server', 'client']
@@ -322,11 +322,11 @@ class Connection:
         pass
 
     def runAsSend(self, obj: object) -> None:
-        self._sending_thread = Thread(target = self._sendrun)
+        self._sending_thread = _Thread(target = self._sendrun)
         self._sending_thread.start()
 
     def runAsRecv(self) -> None:
-        self._recv_thread = Thread(target = self._)
+        self._recv_thread = _Thread(target = self._)
         
             
         
@@ -341,43 +341,68 @@ class ConnectionTunnel:
         self._acc_sock.settimeout(2.0)
         self._main_loop = None
         self._still_accepting = False
+        self._vertifying_socks = 0
         self._retsock_queue = None
+        self._ban_lock = _Lock()
+        self._check_lock = _Lock()
+        self._flg_lock = _Lock()
         self._banned: _Dict[str, bool] = {}
-        self._sv = _SV(core_key, 64)
+        self._core_key = core_key
     
-    def _loop(self) -> None:
-        while self._still_accepting:
-            if len(self._banned) > 1e5: self._banned.clear()
-            try: sock, addr = self._acc_sock.accept()
-            except TimeoutError: pass
-            else:
-                if self._banned.get(addr[0], False):
-                    sock.close()
-                    continue
-                sock.settimeout(2.0)
-                try: rbytes = sock.recv(64)
-                except TimeoutError:
-                    sock.close()
+    def _recvsoc(self, sock: _socket, addr: _Tuple[str, int], _sv: _SV) -> None:
+        with self._ban_lock:
+            ban_state = self._banned.get(addr[0], False)
+        if ban_state:
+            sock.close()
+            return
+        sock.settimeout(2.0)
+        try: rbytes = sock.recv(64)
+        except TimeoutError:
+            sock.close()
+            with self._ban_lock:
+                self._banned[addr[0]] = True
+        else:
+            if len(rbytes) != 64:
+                sock.close()
+                with self._ban_lock:
                     self._banned[addr[0]] = True
+            elif not _sv.vertifyBytes(rbytes):
+                sock.close()
+                with self._ban_lock:
+                    self._banned[addr[0]] = True
+            else:
+                sock.settimeout(None)
+                with self._check_lock: self._vertifying_socks -= 1
+                self._retsock_queue.put((sock, addr))
+
+    def _loop(self) -> None:
+        while True:
+            with self._flg_lock:
+                if not self._still_accepting: break
+            with self._ban_lock: 
+                if len(self._banned) > 1e5:
+                    self._banned.clear()
+            can_connect = True
+            with self._check_lock:
+                if self._vertifying_socks > 100: can_connect = False
+            if can_connect:
+                try: sock, addr = self._acc_sock.accept()
+                except TimeoutError: pass
                 else:
-                    if len(rbytes) != 64:
-                        sock.close()
-                        self._banned[addr[0]] = True
-                    elif not self._sv.vertifyBytes(rbytes):
-                        sock.close()
-                        self._banned[addr[0]] = True
-                    else:
-                        sock.settimeout(None)
-                        self._retsock_queue.put((sock, addr))
-    
+                    with self._check_lock:
+                        self._vertifying_socks += 1
+                        _Thread(target = self._recvsoc, args = (sock, addr, _SV(self._core_key, 64))).start()
+                
     def terminateLoop(self) -> None:
-        self._still_accepting = False
+        with self._flg_lock:
+            self._still_accepting = False
 
     def acceptLoop(self, retsock_queue: Queue) -> None:
         self._still_accepting = True
         self._retsock_queue = retsock_queue
-        self._main_loop = Thread(target = self._loop)
+        self._main_loop = _Thread(target = self._loop)
         self._main_loop.start()
+
 
 class SocketCell:
     # TODO use small queue
