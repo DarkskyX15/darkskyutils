@@ -10,10 +10,9 @@ from socket import socket as _socket, AF_INET, AF_INET6, SOCK_STREAM
 from base64 import b64decode as _b64de, b64encode as _b64en
 from multiprocessing import Process, Queue
 from threading import Thread as _Thread, Lock as _Lock
-from queue import Empty, Queue as ThreadQueue
+from queue import Empty, Full, Queue as ThreadQueue
 
 SERVING_SIDE = _Literal['server', 'client']
-SERVICE_SIGN = _Literal['SOCK_ADD', 'SOCK_DIED', 'TOCELL', 'TOSERVICE', 'SHUTDOWN']
 
 class PacketError(Exception):
     r'''在`Packeter`类的方法执行过程中遇错误默认抛出的错误类型'''
@@ -85,37 +84,29 @@ class MsgBag:
     r'''
     TCP传输时传递的消息包
     '''
-    def __init__(self, service_signs: _List[SERVICE_SIGN] = [], msg_signs: _List[str] = [], 
-                 data: _Any = None, with_dict: _Dict = None) -> None:
-        self.service_signs = service_signs
-        self.msg_signs = msg_signs
-        self.obj = data
-        if with_dict != None:
-            self.service_signs = with_dict.get('services', [])
-            self.msg_signs = with_dict.get('msgsign', [])
-            self.obj = with_dict.get('obj', None)
-        self.check_buffer = None
-        self.msg_buffer = None
+    def __init__(self, tags: _List[str] = [], val: _Any = None):
+        self._tags = {}
+        self._val = val
+        for tag in tags:
+            self._tags[tag] = True
+    
+    def getValue(self) -> _Any:
+        return self._val
 
-    def checkMsgSign(self, msg_sign: str) -> bool:
-        if self.msg_buffer == None:
-            self.msg_buffer = dict()
-            for msgs in self.msg_signs:
-                self.msg_buffer[msgs] = True
-        return self.msg_buffer.get(msg_sign, False)
+    def addTag(self, tag: str) -> None:
+        self._tags[tag] = True
 
-    def checkServiceSign(self, service_sign: str) -> bool:
-        if self.check_buffer == None:
-            self.check_buffer = dict()
-            for service in self.service_signs:
-                self.check_buffer[service] = True
-        return self.check_buffer.get(service_sign, False)
+    def checkTag(self, tag: str) -> bool:
+        return self._tags.get(tag, False)
 
-    def getObject(self) -> object:
-        return self.obj
+    def removeTag(self, tag: str) -> None:
+        if self._tags.get(tag, False):
+            self._tags[tag] = False
 
-    def getBag(self) -> _Dict:
-        return {'services': self.service_signs, 'obj': self.obj}
+    def clearTag(self) -> None:
+        self._tags.clear()
+
+
 
 class Packeter:
     r'''
@@ -238,25 +229,32 @@ class Packeter:
 # server -> Connection side -> ExposureTunnels(MultiT but one Process)
 # 
 
+# TODO: work_as_recv / work_as_send
 class Connection:
-    def __init__(self, socket: _socket, sid: int = None, addr: _Tuple[str, int] = None, 
-                 client_side: _Literal['send', 'recv'] = 'send', encoder: _Any = None) -> None:
+    def __init__(self, logger: _LogW, socket: _socket, side: _Literal['send', 'recv', 'server'],
+                 sid: int = None, addr: _Tuple[str, int] = None, encoder: _Any = None) -> None:
         self._socket = socket
         self._sid = sid
+        if sid != None: self._sign = 'CONNECT{}'.format(sid)
         self._addr = addr
         self._packter = None
         self._coder = None
-        self._codeclass = AESCoder if encoder == None else encoder
-        self._sending_thread = None
-        self._recv_thread = None
-        self._type: _Literal['send', 'recv'] = client_side
+        self._codeclass = Coder if encoder == None else encoder
+        self._working_thread = None
+        self._vertify_thread = None
+        self._side: _Literal['send', 'recv', 'server'] = side
+        self._logger = logger
+        self._msgq: ThreadQueue = None
+        self._workq: ThreadQueue = None
+        self._status: _Literal['CLOSED', 'BAD', 'VERTIFY', 'NORM'] = 'BAD'
+        self._status_lock = _Lock()
     
-    def vertifySocketAsServer(self) -> bool:
+    def _vertifySocketAsServer(self) -> bool:
         try: self._socket.sendall(b'----VERITIFY----')
         except Exception:
             self._socket.close()
             return False
-        self._socket.settimeout(3.0)
+        self._socket.settimeout(5.0)
         try: pkey = self._socket.recv(2048)
         except TimeoutError:
             self._socket.close()
@@ -278,12 +276,12 @@ class Connection:
                 return False
             else:
                 self._coder = self._codeclass(aesk, iv)
-                self._packter = Packeter(self._coder, 'strict')
+                self._packter = Packeter(self._coder, 'loose', self._logger)
                 self._packter.sendPacket(self._socket, (self._sid, self._addr))
-                self._type = self._packter.recvPacket(self._socket)
-        return True    
+                self._side = self._packter.recvPacket(self._socket)
+        return True
 
-    def vertifySocketAsClient(self) -> bool:
+    def _vertifySocketAsClient(self) -> bool:
         try: sign = self._socket.recv(16)
         except Exception:
             self._socket.close()
@@ -308,32 +306,51 @@ class Connection:
                 return False
         aes_r = rsacod.decrypt(aes_r)
         self._coder = self._codeclass(aes_r[:16], aes_r[16:])
-        self._packter = Packeter(self._coder, 'strict')
+        self._packter = Packeter(self._coder, 'loose', self._logger)
         cdata = self._packter.recvPacket(self._socket)
         self._sid = cdata[0]
+        self._sign = 'CONNECT{}'.format(self._sid)
         self._addr = cdata[1]
-        self._packter.sendPacket(self._socket, self._type)
+        self._packter.sendPacket(self._socket, self._side)
         return True
-        
-    def _sendrun(self, obj: object) -> None:
-        self._packter.sendPacket(self._socket, )
+    
+    def _vertify(self) -> None:
+        with self._status_lock: self._status = 'VERTIFY'
+        if self._side == 'server': res = self._vertifySocketAsServer()
+        else: res = self._vertifySocketAsClient()
+        if res:
+            with self._status_lock: self._status = 'NORM'
+            self._msgq.put(MsgBag(['CON_CONTROL','VERTIFIED'], (self._sid, self._side)))
+        else:
+            self._socket.close()
+            with self._status_lock: self._status = 'CLOSED'
+            self._msgq.put(MsgBag(['CON_CONTROL', 'CLOSED'], (self._sid, self._side)))
 
-    def _recvrun(self) -> None:
+    def _work_as_recv(self) -> None:
         pass
 
-    def runAsSend(self, obj: object) -> None:
-        self._sending_thread = _Thread(target = self._sendrun)
-        self._sending_thread.start()
+    def _work_as_send(self) -> None:
+        pass
 
-    def runAsRecv(self) -> None:
-        self._recv_thread = _Thread(target = self._)
-        
-            
-        
+    def work(self, msgQ: ThreadQueue) -> None:
+        self._workq = msgQ
+        if self._side == 'recv':
+            self._working_thread = _Thread(target = self._work_as_recv)
+            self._working_thread.start()
+        elif self._side == 'send':
+            self._working_thread = _Thread(target = self._work_as_send)
+            self._working_thread.start()
 
+    def asyncVertify(self, do_async: bool, msgQ: ThreadQueue):
+        self._msgq = msgQ
+        if do_async:
+            self._vertify_thread = _Thread(target = self._vertify)
+            self._vertify_thread.start()
+        else:
+            self._vertify()
 
 class ConnectionTunnel:
-    def __init__(self, bind_addr: _Tuple[str, int], ipv6: bool = False, core_key: int = 115) -> None:
+    def __init__(self, bind_addr: _Tuple[str, int], core_key: int, ipv6: bool = False) -> None:
         if not ipv6: self._acc_sock = _socket(AF_INET, SOCK_STREAM)
         else: self._acc_sock = _socket(AF_INET6, SOCK_STREAM)
         self._acc_sock.bind(bind_addr)
@@ -350,11 +367,6 @@ class ConnectionTunnel:
         self._core_key = core_key
     
     def _recvsoc(self, sock: _socket, addr: _Tuple[str, int], _sv: _SV) -> None:
-        with self._ban_lock:
-            ban_state = self._banned.get(addr[0], False)
-        if ban_state:
-            sock.close()
-            return
         sock.settimeout(2.0)
         try: rbytes = sock.recv(64)
         except TimeoutError:
@@ -373,7 +385,7 @@ class ConnectionTunnel:
             else:
                 sock.settimeout(None)
                 with self._check_lock: self._vertifying_socks -= 1
-                self._retsock_queue.put((sock, addr))
+                self._retsock_queue.put(MsgBag(['NEWSOCK'], (sock, addr)))
 
     def _loop(self) -> None:
         while True:
@@ -389,6 +401,10 @@ class ConnectionTunnel:
                 try: sock, addr = self._acc_sock.accept()
                 except TimeoutError: pass
                 else:
+                    with self._ban_lock:
+                        if self._banned.get(addr[0], False):
+                            sock.close()
+                            continue
                     with self._check_lock:
                         self._vertifying_socks += 1
                         _Thread(target = self._recvsoc, args = (sock, addr, _SV(self._core_key, 64))).start()
@@ -403,24 +419,33 @@ class ConnectionTunnel:
         self._main_loop = _Thread(target = self._loop)
         self._main_loop.start()
 
-
+# TODO: Compelete SocketCell
+# Cell run in a Process
+# Cell check vertify state of Connection & make it work
+# Send Distribute MsgBag 
+# Collect returned MsgBag
+              
 class SocketCell:
-    # TODO use small queue
-    def __init__(self, backward_queue: Queue, forward_queue: Queue, cell_queue: Queue, cell_id: int) -> None:
-        self._backq = backward_queue
-        self._frontq = forward_queue
+    def __init__(self, cell_queue: Queue, hub_queue: Queue, cell_id: int) -> None:
         self._cellq = cell_queue
+        self._hubq = hub_queue
         self._process = None
-        self._sid_mapping: _Dict[int, Connection] = {}
+        self._connect_list: _List[Connection] = []
         self._cid = cell_id
     
     def _service(self) -> None:
-        pass
+        while True:
+            msg_bag: MsgBag = self._cellq.get()
 
     def run(self) -> None:
         self._process = Process(target = self._service)
         self._process.start()
 
+# TODO: Only Designed for Server
+# Manage Socket Cells
+# Distribute Sockets
+# Distributes Bag from Services
+# Send back Bags & Manage registered Services
 class SocketHub:
     def __init__(self, use_coder: _Any) -> None:
         self._service_process: Process = None
@@ -480,7 +505,7 @@ class SocketHub:
                 tunnel = ConnectionTunnel((addr_pair[0], addr_pair[1]), self._use_ipv6, self._core_key)
                 tunnel.acceptLoop(self._retsocket_queue)
                 self._tunnels.append(tunnel)
-            self._msg_thread = Thread(target = self._forwardmsgservice)
+            self._msg_thread = _Thread(target = self._forwardmsgservice)
             self._msg_thread.start()
 
             while self._running:
