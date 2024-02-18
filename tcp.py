@@ -1,6 +1,7 @@
 # -*- coding: UTF-8 -*-
 r'''TCP相关的工具'''
 from os import cpu_count as _cpu_count
+from time import sleep as _slp
 from typing import Literal as _Literal, Any as _Any, Union as _Union, Tuple as _Tuple, List as _List, Dict as _Dict
 from json import dumps as _dumps, loads as _loads
 from sky_lib.encrypt import AES as _AES, RSA as _RSA, RSAKeyPair as _KeyPair, SimpleVertify as _SV, RandomStr as _RS
@@ -169,6 +170,8 @@ class Packeter:
                 send_data_size -= 1024
                 send_data_pointer += 1024
             return True
+        except TimeoutError as e:
+            raise e
         except Exception as e:
             e_str = 'Error occurred during sending process: '
             if self._error == 'strict': raise PacketError(e_str, e.args)
@@ -202,6 +205,8 @@ class Packeter:
                     recv_size = 1024
                 pack_ += client.recv(recv_size)
                 size = len(pack_)
+        except TimeoutError as e:
+            raise e
         except Exception as e:
             e_str = 'Error occurred during recv process: '
             if self._error == 'strict': raise PacketError(e_str, e.args)
@@ -226,10 +231,6 @@ class Packeter:
             return None
         else: return obj
 
-# server -> Connection side -> ExposureTunnels(MultiT but one Process)
-# 
-
-# TODO: work_as_recv / work_as_send
 class Connection:
     def __init__(self, logger: _LogW, socket: _socket, side: _Literal['send', 'recv', 'server'],
                  sid: int = None, addr: _Tuple[str, int] = None, encoder: _Any = None) -> None:
@@ -239,15 +240,17 @@ class Connection:
         self._addr = addr
         self._packter = None
         self._coder = None
-        self._codeclass = Coder if encoder == None else encoder
+        self._codeclass = AESCoder if encoder == None else encoder
         self._working_thread = None
         self._vertify_thread = None
         self._side: _Literal['send', 'recv', 'server'] = side
         self._logger = logger
         self._msgq: ThreadQueue = None
         self._workq: ThreadQueue = None
-        self._status: _Literal['CLOSED', 'BAD', 'VERTIFY', 'NORM'] = 'BAD'
+        self._status: _Literal['CLOSED', 'BAD', 'VERTIFY', 'NORM', 'ERR'] = 'BAD'
         self._status_lock = _Lock()
+        self._working_flg = False
+        self._work_lock = _Lock()
     
     def _vertifySocketAsServer(self) -> bool:
         try: self._socket.sendall(b'----VERITIFY----')
@@ -276,9 +279,10 @@ class Connection:
                 return False
             else:
                 self._coder = self._codeclass(aesk, iv)
-                self._packter = Packeter(self._coder, 'loose', self._logger)
+                self._packter = Packeter(self._coder, 'strict')
                 self._packter.sendPacket(self._socket, (self._sid, self._addr))
                 self._side = self._packter.recvPacket(self._socket)
+                self._side = 'recv' if self._side == 'send' else 'send'
         return True
 
     def _vertifySocketAsClient(self) -> bool:
@@ -306,7 +310,7 @@ class Connection:
                 return False
         aes_r = rsacod.decrypt(aes_r)
         self._coder = self._codeclass(aes_r[:16], aes_r[16:])
-        self._packter = Packeter(self._coder, 'loose', self._logger)
+        self._packter = Packeter(self._coder, 'strict')
         cdata = self._packter.recvPacket(self._socket)
         self._sid = cdata[0]
         self._sign = 'CONNECT{}'.format(self._sid)
@@ -327,21 +331,73 @@ class Connection:
             self._msgq.put(MsgBag(['CON_CONTROL', 'CLOSED'], (self._sid, self._side)))
 
     def _work_as_recv(self) -> None:
-        pass
+        self._socket.settimeout(8.0)
+        while True:
+            with self._work_lock:
+                if not self._working_flg:
+                    self._socket.close()
+                    with self._status_lock: self._status = 'CLOSED'
+                    self._workq.put(MsgBag(['CON_CONTROL', 'S_CLOSE'], self._sid))
+                    break
+            try:
+                msg = self._packter.recvPacket(self._socket)
+            except Exception:
+                self._socket.close()
+                with self._status_lock: self._status = 'ERR'
+                self._workq.put(MsgBag(['CON_CONTROL', 'ERR'], self._sid))
+                break
+            else:
+                if isinstance(msg, str) and msg == 'HEARTBEAT': pass
+                if isinstance(msg, str) and msg == 'CLOSE':
+                    self._socket.close()
+                    with self._status_lock: self._status = 'CLOSED'
+                    self._workq.put(MsgBag(['CON_CONTROL', 'C_CLOSE'], self._sid))
+                else:
+                    self._workq.put(MsgBag(['NORMMSG', self._sign], msg))
 
     def _work_as_send(self) -> None:
-        pass
+        self._socket.settimeout(8.0)
+        while True:
+            with self._work_lock:
+                if not self._working_flg:
+                    self._socket.close()
+                    with self._status_lock: self._status = 'CLOSED'
+                    self._workq.put(MsgBag(['CON_CONTROL', 'S_CLOSE'], self._sid))
+                    break
+            try: pbag: MsgBag = self._workq.get_nowait()
+            except Empty:
+                try: self._packter.sendPacket(self._socket, 'HEARTBEAT')
+                except Exception:
+                    self._socket.close()
+                    with self._status_lock: self._status = 'ERR'
+                    self._workq.put(MsgBag(['CON_CONTROL', 'ERR'], self._sid))
+                    break
+                else: _slp(5.0)
+            else:
+                try: self._packter.sendPacket(self._socket, pbag.getValue())
+                except Exception:
+                    self._socket.close()
+                    with self._status_lock: self._status = 'ERR'
+                    self._workq.put(MsgBag(['CON_CONTROL', 'ERR'], self._sid))
+                    break
+                if pbag.checkTag('CMD') and pbag.getValue() == 'CLOSE':
+                    self._socket.close()
+                    with self._status_lock: self._status = 'CLOSED'
+                    self._workq.put(MsgBag(['CON_CONTROL', 'C_CLOSE']))
 
     def work(self, msgQ: ThreadQueue) -> None:
         self._workq = msgQ
         if self._side == 'recv':
             self._working_thread = _Thread(target = self._work_as_recv)
-            self._working_thread.start()
         elif self._side == 'send':
             self._working_thread = _Thread(target = self._work_as_send)
-            self._working_thread.start()
+        with self._work_lock: self._working_flg = True
+        self._working_thread.start()
 
-    def asyncVertify(self, do_async: bool, msgQ: ThreadQueue):
+    def stopWork(self) -> None:
+        with self._work_lock: self._working_flg = False
+
+    def vertify(self, do_async: bool, msgQ: ThreadQueue):
         self._msgq = msgQ
         if do_async:
             self._vertify_thread = _Thread(target = self._vertify)
