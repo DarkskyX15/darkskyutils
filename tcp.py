@@ -9,11 +9,12 @@ from sky_lib.logger import LoggerWrapper as _LogW
 from sky_lib.config import Config, CONFIGTYPE
 from socket import socket as _socket, AF_INET, AF_INET6, SOCK_STREAM
 from base64 import b64decode as _b64de, b64encode as _b64en
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Value, Lock as _PLock
 from threading import Thread as _Thread, Lock as _Lock
 from queue import Empty, Full, Queue as ThreadQueue
 
 SERVING_SIDE = _Literal['server', 'client']
+SYS_SIGN = _Literal['sock_control', 'cellcmd', 'sockethub', 'ctunnel']
 
 class PacketError(Exception):
     r'''在`Packeter`类的方法执行过程中遇错误默认抛出的错误类型'''
@@ -85,12 +86,16 @@ class MsgBag:
     r'''
     TCP传输时传递的消息包
     '''
-    def __init__(self, tags: _List[str] = [], val: _Any = None):
+    def __init__(self, tags: _List[str] = [], val: _Any = None, sys_sign: SYS_SIGN = None, navigate: int = -1):
         self._tags = {}
         self._val = val
+        self.sys_sign: SYS_SIGN = sys_sign
+        self.navigate = navigate
         for tag in tags:
             self._tags[tag] = True
-    
+    def __str__(self) -> str:
+        return 'Tags:{} Value:{}'.format(tuple(self._tags.keys()), self._val)
+
     def getValue(self) -> _Any:
         return self._val
 
@@ -106,7 +111,6 @@ class MsgBag:
 
     def clearTag(self) -> None:
         self._tags.clear()
-
 
 
 class Packeter:
@@ -280,7 +284,7 @@ class Connection:
             else:
                 self._coder = self._codeclass(aesk, iv)
                 self._packter = Packeter(self._coder, 'strict')
-                self._packter.sendPacket(self._socket, (self._sid, self._addr))
+                self._packter.sendPacket(self._socket, [self._sid, self._addr])
                 self._side = self._packter.recvPacket(self._socket)
                 self._side = 'recv' if self._side == 'send' else 'send'
         return True
@@ -324,11 +328,11 @@ class Connection:
         else: res = self._vertifySocketAsClient()
         if res:
             with self._status_lock: self._status = 'NORM'
-            self._msgq.put(MsgBag(['CON_CONTROL','VERTIFIED'], (self._sid, self._side)))
+            self._msgq.put(MsgBag(['VERTIFIED'], (self._sid, self._side), sys_sign = 'sock_control'))
         else:
             self._socket.close()
             with self._status_lock: self._status = 'CLOSED'
-            self._msgq.put(MsgBag(['CON_CONTROL', 'CLOSED'], (self._sid, self._side)))
+            self._msgq.put(MsgBag(['CLOSED'], (self._sid, self._side), sys_sign = 'sock_control'))
 
     def _work_as_recv(self) -> None:
         self._socket.settimeout(8.0)
@@ -337,23 +341,23 @@ class Connection:
                 if not self._working_flg:
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['CON_CONTROL', 'S_CLOSE'], self._sid))
+                    self._workq.put(MsgBag(['S_CLOSE'], self._sid, sys_sign = 'sock_control'))
                     break
             try:
                 msg = self._packter.recvPacket(self._socket)
             except Exception:
                 self._socket.close()
                 with self._status_lock: self._status = 'ERR'
-                self._workq.put(MsgBag(['CON_CONTROL', 'ERR'], self._sid))
+                self._workq.put(MsgBag(['ERR'], self._sid))
                 break
             else:
                 if isinstance(msg, str) and msg == 'HEARTBEAT': pass
                 if isinstance(msg, str) and msg == 'CLOSE':
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['CON_CONTROL', 'C_CLOSE'], self._sid))
+                    self._workq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sock_control'))
                 else:
-                    self._workq.put(MsgBag(['NORMMSG', self._sign], msg))
+                    self._workq.put(MsgBag([self._sign, msg[0]], msg[1], navigate = self._sid))
 
     def _work_as_send(self) -> None:
         self._socket.settimeout(8.0)
@@ -362,28 +366,27 @@ class Connection:
                 if not self._working_flg:
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['CON_CONTROL', 'S_CLOSE'], self._sid))
+                    self._workq.put(MsgBag(['S_CLOSE'], self._sid, sys_sign = 'sock_control'))
                     break
-            try: pbag: MsgBag = self._workq.get_nowait()
+            try: pbag: MsgBag = self._workq.get(True, 5.0)
             except Empty:
                 try: self._packter.sendPacket(self._socket, 'HEARTBEAT')
                 except Exception:
                     self._socket.close()
                     with self._status_lock: self._status = 'ERR'
-                    self._workq.put(MsgBag(['CON_CONTROL', 'ERR'], self._sid))
+                    self._workq.put(MsgBag(['ERR'], self._sid, sys_sign = 'sock_control'))
                     break
-                else: _slp(5.0)
             else:
                 try: self._packter.sendPacket(self._socket, pbag.getValue())
                 except Exception:
                     self._socket.close()
                     with self._status_lock: self._status = 'ERR'
-                    self._workq.put(MsgBag(['CON_CONTROL', 'ERR'], self._sid))
+                    self._workq.put(MsgBag(['ERR'], self._sid, sys_sign = 'sock_control'))
                     break
                 if pbag.checkTag('CMD') and pbag.getValue() == 'CLOSE':
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['CON_CONTROL', 'C_CLOSE']))
+                    self._workq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sock_control'))
 
     def work(self, msgQ: ThreadQueue) -> None:
         self._workq = msgQ
@@ -441,7 +444,7 @@ class ConnectionTunnel:
             else:
                 sock.settimeout(None)
                 with self._check_lock: self._vertifying_socks -= 1
-                self._retsock_queue.put(MsgBag(['NEWSOCK'], (sock, addr)))
+                self._retsock_queue.put(MsgBag(['NEWSOCK'], (sock, addr), sys_sign = 'ctunnel'))
 
     def _loop(self) -> None:
         while True:
@@ -469,7 +472,7 @@ class ConnectionTunnel:
         with self._flg_lock:
             self._still_accepting = False
 
-    def acceptLoop(self, retsock_queue: Queue) -> None:
+    def acceptLoop(self, retsock_queue: ThreadQueue) -> None:
         self._still_accepting = True
         self._retsock_queue = retsock_queue
         self._main_loop = _Thread(target = self._loop)
@@ -482,18 +485,31 @@ class ConnectionTunnel:
 # Collect returned MsgBag
               
 class SocketCell:
-    def __init__(self, cell_queue: Queue, hub_queue: Queue, cell_id: int) -> None:
+    def __init__(self, cell_queue: Queue, hub_queue: Queue, cell_id: int, maxrate: int, 
+                 max_size: int, logger: _LogW) -> None:
         self._cellq = cell_queue
         self._hubq = hub_queue
         self._process = None
         self._connect_list: _List[Connection] = []
         self._cid = cell_id
+        self._maxsize = max_size
+        self._maxrate = maxrate
+        self._running_flg = Value('b', False, lock = False)
+        self._run_lock = _PLock()
+        self._logger = logger
     
     def _service(self) -> None:
         while True:
+            with self._run_lock:
+                if not self._running_flg:
+                    pass
             msg_bag: MsgBag = self._cellq.get()
 
+    def stop(self) -> None:
+        with self._run_lock: self._running_flg = False
+
     def run(self) -> None:
+        with self._run_lock: self._running_flg = True
         self._process = Process(target = self._service)
         self._process.start()
 
@@ -503,141 +519,109 @@ class SocketCell:
 # Distributes Bag from Services
 # Send back Bags & Manage registered Services
 class SocketHub:
-    def __init__(self, use_coder: _Any) -> None:
-        self._service_process: Process = None
-        self._retsocket_queue: Queue = Queue()
-        self._running: bool = False
-        self._connect_id: int = 0
-        self._alive_cons: int = 0
-        self._forward_queue: Queue = Queue()
-        self._backward_queue: Queue = Queue()
-        self._tunnels: _List[ConnectionTunnel] = []
-        self._cell_queues: _List[Queue] = []
-        self._cell_list: _List[SocketCell] = []
-        self._cell_pressure: _List[int] = []
-        self._msg_thread = None
-        self._usecoder = use_coder
-        # Overall Configs
-        self._max_connects = 0
-        self._core_key = 0
-        self._use_ipv6 = False
-        self._is_server = False
-        self._cell_cnt: int = 0
-        # Server Side Configs
-        self._listen_addr_list: _List[_List[str, int]] = []
+    def __init__(self, cfg: Config, logger: _LogW, logL: _List[_LogW]) -> None:
+        self._inputq: Queue = Queue()
+        self._outputq: ThreadQueue = ThreadQueue()
+        self._hub_queue: Queue = Queue()
+        self._hub_running: bool = False
+        self._running_lock = _Lock()
+        self._dist_run: bool = False
+        self._dist_lock = _Lock()
+        self._upload_flg: bool = False
+        self._uplock = _Lock()
+        self._upload_thread = None
+        self._hub_thread = None
+        self._distr_thread = None
+        self._bind_addresses: _List[_Tuple[str, int]] = cfg.queryConfig('bind_addr')
+        self._ctunnels: _List[ConnectionTunnel] = []
+        self._cellist: _List[SocketCell] = []
+        self._cellqs: _List[Queue] = []
+        self._alive_list: _List[int] = []
+        self._alive_lock = _Lock()
+        self._sid_cid_map: _Dict[int, int] = {}
+        self._max_con_per_cell: int = cfg.queryConfig('maxcpc')
+        self._max_cell: int = cfg.queryConfig('maxcell')
+        self._maxrate: int = cfg.queryConfig('maxrate')
+        self._core_key: int = cfg.queryConfig('corekey')
+        self._use_ipv6: bool = cfg.queryConfig('ipv6')
+        self._logger: _LogW = logger
+        self._logL: _List[_LogW] = logL
+        self._sid_iter = 0
+
+    def _uploadloop(self) -> None:
+        while True:
+            with self._uplock:
+                if not self._upload_flg: break
+            mbag: MsgBag = self._inputq.get()
+            with self._alive_lock:
+                self._cellqs[self._sid_cid_map[mbag.navigate]].put(mbag)
+
+    def _distributeloop(self) -> None:
+        while True:
+            with self._dist_lock:
+                if not self._dist_run: break
+            mbag: MsgBag = self._hub_queue.get()
+            if mbag.sys_sign == 'sock_control' and mbag.checkTag('SOCKOUT'):
+                with self._alive_lock:
+                    self._alive_list[self._sid_cid_map[mbag.getValue()]] -= 1
+                    self._sid_cid_map.pop(mbag.getValue())
+            else:
+                self._outputq.put(mbag)
+
+    def _hubloop(self) -> None:
+        sock_queue = ThreadQueue()
+        for addr in self._bind_addresses:
+            ct = ConnectionTunnel(addr, self._core_key, self._use_ipv6)
+            ct.acceptLoop(sock_queue)
+            self._ctunnels.append(ct)
         
-        # Client Side Configs
-        self._connect_addr_list: _List[_List[str, int]] = []
-        self._connect_repeats: _List[int] = []
+        for index in range(self._max_cell):
+            celq = Queue()
+            cel = SocketCell(celq, self._hub_queue, index, self._maxrate, self._max_con_per_cell, self._logL[index])
+            self._cellist.append(cel)
+            self._cellqs.append(celq)
+            self._alive_list.append(0)
+            cel.run()
+        
+        while True:
+            with self._running_lock:
+                if not self._hub_running:
+                    for ct in self._ctunnels: ct.terminateLoop()
+                    for sc in self._cellist: sc.stop()
+                    self._outputq.put(MsgBag(['HUBCLOSE'], None, sys_sign = 'sockethub'))
+                    break
+            
+            sock_bag: MsgBag = sock_queue.get()
+            if sock_bag.sys_sign == 'ctunnel' and sock_bag.checkTag('NEWSOCK'):
+                new_sock: _socket = sock_bag.getValue()[0]
+                with self._alive_lock:
+                    miniter, minn = 0, self._alive_list[0]
+                    for index in range(self._max_cell):
+                        if self._alive_list[index] < minn:
+                            minn = self._alive_list[index]
+                            miniter = index
+                    if self._alive_list[miniter] < self._max_con_per_cell:
+                        self._cellqs[miniter].put(MsgBag(['SOCKIN'], (sock_bag.getValue(), self._sid_iter), sys_sign = 'cellcmd'))
+                        self._alive_list[miniter] += 1
+                        self._sid_cid_map[self._sid_iter] = miniter
+                        self._sid_iter += 1
+                    else: new_sock.close()            
     
-    def _forwardmsgservice(self) -> None:
-        # TODO
-        '''线程循环检查前向队列，分发数据包
-        特殊地，socket的进入和推出包也放在前向队列
-        '''
-        # # TODO Change Method
-        # if connect_res:
-        #     min_pres = self._cell_pressure[-1]
-        #     min_pres_pos = len(self._cell_pressure) - 1
-        #     for index in range(min_pres_pos + 1):
-        #         if self._cell_pressure[index] < min_pres:
-        #             min_pres = self._cell_pressure[index]
-        #             min_pres_pos = index
-        #     self._cell_queues[min_pres_pos].put(connect)
-        #     self._alive_cons += 1
-        #     self._connect_id += 1
-        pass
+    def terminateLoop(self) -> None:
+        with self._running_lock: self._hub_running = False
+        with self._dist_lock: self._dist_run = False
+        with self._uplock: self._upload_flg = False
 
-    def _sockethub(self) -> None:
-        if self._is_server:
-            # Init cells & tunnels
-            for index in range(self._cell_cnt):
-                cellq = Queue()
-                cellins = SocketCell(self._backward_queue, cellq, index)
-                cellins.run()
-                self._cell_list.append(cellins)
-                self._cell_queues.append(cellq)
-            for addr_pair in self._listen_addr_list:
-                tunnel = ConnectionTunnel((addr_pair[0], addr_pair[1]), self._use_ipv6, self._core_key)
-                tunnel.acceptLoop(self._retsocket_queue)
-                self._tunnels.append(tunnel)
-            self._msg_thread = _Thread(target = self._forwardmsgservice)
-            self._msg_thread.start()
+    def startLoop(self) -> None:
+        with self._running_lock: self._hub_running = True
+        with self._dist_lock: self._dist_run = True
+        with self._uplock: self._upload_flg = True
+        self._hub_thread = _Thread(target = self._hubloop)
+        self._hub_thread.start()
+        self._distr_thread = _Thread(target = self._distributeloop)
+        self._distr_thread.start()
+        self._upload_thread = _Thread(target = self._uploadloop)
+        self._upload_thread.start()
 
-            while self._running:
-                if not self._retsocket_queue.empty():
-                    try: soc_tp: _Tuple[_socket, _Tuple[str, int]] = self._retsocket_queue.get_nowait()
-                    except Empty: pass
-                    else:
-                        if self._alive_cons >= self._max_connects:
-                            soc_tp[0].close()
-                        else:
-                            # Second Vertify
-                            connect = Connection(soc_tp[0], self._connect_id, soc_tp[1], self._usecoder)
-                            connect_res = connect.vertifySocketAsServer()
-                            if not connect_res: soc_tp[0].close()
-                            self._forward_queue.put(MsgBag(['SOCK_ADD'], [], connect))
-                            
-
-        else:
-            pass
-
-    def runServiceLoop(self, block: bool = True) -> None:
-        self._running = True
-        if block: self._sockethub()
-        else:
-            self._service_process = Process(target = self._sockethub)
-            self._service_process.start()
-
-    def stopServiceLoop(self) -> None:
-        self._running = False
-        if self._is_server:
-            for tunnel in self._tunnels:
-                tunnel.terminateLoop()
-        else:
-            pass
-
-    def exportDefaultConfig(self, export_config_name: str, side: SERVING_SIDE) -> Config:
-        df_config = Config(export_config_name)
-        df_config.setConfig('use_ipv6', False)
-        df_config.setConfig('core_key', 115)
-        cell_cnt = _cpu_count() // 2
-        cell_cnt = cell_cnt if cell_cnt else 1
-        df_config.setConfig('cell_cnt', cell_cnt)
-        df_config.setConfig('max_connects', int(1e4))
-        if side == 'server':
-            df_config.setConfig('is_server', True)
-            df_config.setConfig('listen_addr_list', [['127.0.0.1', 10566]])
-        elif side == 'client':
-            df_config.setConfig('is_server', False)
-            df_config.setConfig('connect_addr_list', [['127.0.0.1', 10566]])
-            df_config.setConfig('connect_repeats', [1])
-        df_config.saveToFile('simple')
-        return df_config
-
-    def exportThisConfig(self, export_config_name: str, cfg_type: CONFIGTYPE, cfg_key: bytes = None) -> Config:
-        this_config = Config(export_config_name)
-        this_config.setConfig('is_server', self._is_server)
-        this_config.setConfig('use_ipv6', self._use_ipv6)
-        this_config.setConfig('core_key', self._core_key)
-        this_config.setConfig('cell_cnt', self._cell_cnt)
-        this_config.setConfig('max_connects', self._max_connects)
-        if self._is_server:
-            this_config.setConfig('listen_addr_list', self._listen_addr_list)
-        else:
-            this_config.setConfig('connect_addr_list', self._connect_addr_list)
-            this_config.setConfig('connect_repeats', self._connect_repeats)
-        this_config.saveToFile(cfg_type, cfg_key)
-        return this_config
-
-    def loadConfig(self, _config: Config) -> None:
-        self._is_server = _config.queryConfig('is_server')
-        self._use_ipv6 = _config.queryConfig('use_ipv6')
-        self._core_key = _config.queryConfig('core_key')
-        self._cell_cnt = _config.queryConfig('cell_cnt')
-        self._max_connects = _config.queryConfig('max_connects')
-        if self._is_server:
-            self._listen_addr_list = _config.queryConfig('listen_addr_list')
-        else:
-            self._connect_addr_list = _config.queryConfig('connect_addr_list')
-            self._connect_repeats = _config.queryConfig('connect_repeats')
+    def getIOqueue(self) -> _Tuple[Queue, ThreadQueue]:
+        return self._inputq, self._outputq
