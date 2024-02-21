@@ -101,6 +101,9 @@ class LoggerWrapper:
     def warn(self, *logs: _Any, sep: str = ' ') -> None:
         log_t = sep.join([str(log) for log in logs])
         self.pushLog(self.logsPacketer(log_t, 'warn'))
+    
+    def getWrapperInstance(self, phase_name: str):
+        return LoggerWrapper(self.phase_name + '/' + phase_name, self.logs_queue)
 
 class ProcessLogger:
     r'''
