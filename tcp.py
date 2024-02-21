@@ -14,7 +14,7 @@ from threading import Thread as _Thread, Lock as _Lock
 from queue import Empty, Full, Queue as ThreadQueue
 
 SERVING_SIDE = _Literal['server', 'client']
-SYS_SIGN = _Literal['sock_control', 'cellcmd', 'sockethub', 'ctunnel']
+SYS_SIGN = _Literal['sockend', 'socketcell', 'sockethub', 'ctunnel', 'apps']
 
 class PacketError(Exception):
     r'''在`Packeter`类的方法执行过程中遇错误默认抛出的错误类型'''
@@ -236,7 +236,7 @@ class Packeter:
         else: return obj
 
 class Connection:
-    def __init__(self, logger: _LogW, socket: _socket, side: _Literal['send', 'recv', 'server'],
+    def __init__(self, socket: _socket, side: _Literal['send', 'recv', 'server'],
                  sid: int = None, addr: _Tuple[str, int] = None, encoder: _Any = None) -> None:
         self._socket = socket
         self._sid = sid
@@ -248,7 +248,6 @@ class Connection:
         self._working_thread = None
         self._vertify_thread = None
         self._side: _Literal['send', 'recv', 'server'] = side
-        self._logger = logger
         self._msgq: ThreadQueue = None
         self._workq: ThreadQueue = None
         self._status: _Literal['CLOSED', 'BAD', 'VERTIFY', 'NORM', 'ERR'] = 'BAD'
@@ -328,11 +327,11 @@ class Connection:
         else: res = self._vertifySocketAsClient()
         if res:
             with self._status_lock: self._status = 'NORM'
-            self._msgq.put(MsgBag(['VERTIFIED'], (self._sid, self._side), sys_sign = 'sock_control'))
+            self._msgq.put(MsgBag(['VERTIFIED'], self._side, sys_sign = 'sockend', navigate = self._sid))
         else:
             self._socket.close()
             with self._status_lock: self._status = 'CLOSED'
-            self._msgq.put(MsgBag(['CLOSED'], (self._sid, self._side), sys_sign = 'sock_control'))
+            self._msgq.put(MsgBag(['CLOSED'], self._side, sys_sign = 'sockend', navigate = self._sid))
 
     def _work_as_recv(self) -> None:
         self._socket.settimeout(8.0)
@@ -341,23 +340,23 @@ class Connection:
                 if not self._working_flg:
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['S_CLOSE'], self._sid, sys_sign = 'sock_control'))
+                    self._workq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
             try:
                 msg = self._packter.recvPacket(self._socket)
             except Exception:
                 self._socket.close()
                 with self._status_lock: self._status = 'ERR'
-                self._workq.put(MsgBag(['ERR'], self._sid))
+                self._workq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
                 break
             else:
                 if isinstance(msg, str) and msg == 'HEARTBEAT': pass
                 if isinstance(msg, str) and msg == 'CLOSE':
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sock_control'))
+                    self._workq.put(MsgBag(['C_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
                 else:
-                    self._workq.put(MsgBag([self._sign, msg[0]], msg[1], navigate = self._sid))
+                    self._workq.put(MsgBag([self._sign, msg[0]], msg[1], sys_sign = 'apps', navigate = self._sid))
 
     def _work_as_send(self) -> None:
         self._socket.settimeout(8.0)
@@ -366,7 +365,7 @@ class Connection:
                 if not self._working_flg:
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['S_CLOSE'], self._sid, sys_sign = 'sock_control'))
+                    self._workq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
             try: pbag: MsgBag = self._workq.get(True, 5.0)
             except Empty:
@@ -374,19 +373,19 @@ class Connection:
                 except Exception:
                     self._socket.close()
                     with self._status_lock: self._status = 'ERR'
-                    self._workq.put(MsgBag(['ERR'], self._sid, sys_sign = 'sock_control'))
+                    self._workq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
             else:
                 try: self._packter.sendPacket(self._socket, pbag.getValue())
                 except Exception:
                     self._socket.close()
                     with self._status_lock: self._status = 'ERR'
-                    self._workq.put(MsgBag(['ERR'], self._sid, sys_sign = 'sock_control'))
+                    self._workq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
                 if pbag.checkTag('CMD') and pbag.getValue() == 'CLOSE':
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sock_control'))
+                    self._workq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sockend', navigate = self._sid))
 
     def work(self, msgQ: ThreadQueue) -> None:
         self._workq = msgQ
@@ -400,6 +399,9 @@ class Connection:
     def stopWork(self) -> None:
         with self._work_lock: self._working_flg = False
 
+    def getStatus(self) -> None:
+        with self._status_lock: return self._status
+
     def vertify(self, do_async: bool, msgQ: ThreadQueue):
         self._msgq = msgQ
         if do_async:
@@ -409,7 +411,7 @@ class Connection:
             self._vertify()
 
 class ConnectionTunnel:
-    def __init__(self, bind_addr: _Tuple[str, int], core_key: int, ipv6: bool = False) -> None:
+    def __init__(self, bind_addr: _Tuple[str, int], core_key: int, key_len: int, ipv6: bool = False) -> None:
         if not ipv6: self._acc_sock = _socket(AF_INET, SOCK_STREAM)
         else: self._acc_sock = _socket(AF_INET6, SOCK_STREAM)
         self._acc_sock.bind(bind_addr)
@@ -424,16 +426,17 @@ class ConnectionTunnel:
         self._flg_lock = _Lock()
         self._banned: _Dict[str, bool] = {}
         self._core_key = core_key
+        self._key_len = key_len
     
     def _recvsoc(self, sock: _socket, addr: _Tuple[str, int], _sv: _SV) -> None:
         sock.settimeout(2.0)
-        try: rbytes = sock.recv(64)
+        try: rbytes = sock.recv(self._key_len)
         except TimeoutError:
             sock.close()
             with self._ban_lock:
                 self._banned[addr[0]] = True
         else:
-            if len(rbytes) != 64:
+            if len(rbytes) != self._key_len:
                 sock.close()
                 with self._ban_lock:
                     self._banned[addr[0]] = True
@@ -466,7 +469,7 @@ class ConnectionTunnel:
                             continue
                     with self._check_lock:
                         self._vertifying_socks += 1
-                        _Thread(target = self._recvsoc, args = (sock, addr, _SV(self._core_key, 64))).start()
+                        _Thread(target = self._recvsoc, args = (sock, addr, _SV(self._core_key, self._key_len))).start()
                 
     def terminateLoop(self) -> None:
         with self._flg_lock:
@@ -478,48 +481,101 @@ class ConnectionTunnel:
         self._main_loop = _Thread(target = self._loop)
         self._main_loop.start()
 
-# TODO: Compelete SocketCell
-# Cell run in a Process
-# Cell check vertify state of Connection & make it work
-# Send Distribute MsgBag 
-# Collect returned MsgBag
-              
 class SocketCell:
     def __init__(self, cell_queue: Queue, hub_queue: Queue, cell_id: int, maxrate: int, 
-                 max_size: int, logger: _LogW) -> None:
+                 max_size: int, logger: _LogW, encoder: _Any) -> None:
         self._cellq = cell_queue
         self._hubq = hub_queue
         self._process = None
-        self._connect_list: _List[Connection] = []
         self._cid = cell_id
         self._maxsize = max_size
         self._maxrate = maxrate
         self._running_flg = Value('b', False, lock = False)
         self._run_lock = _PLock()
         self._logger = logger
-    
-    def _service(self) -> None:
+        self._encoder = encoder 
+
+    def _service(_running_flg, _run_lock, _hubq: Queue, _cellq: Queue, _maxsize, _maxrate, 
+                 _logger: _LogW, _encoder) -> None:
+        _vertiq = ThreadQueue()
+        _connect_map: _Dict[int, Connection] = {}
+        _msgq_map: _Dict[int, ThreadQueue] = {}
+        _recvq = ThreadQueue()
+        _downlock = _Lock()
+        _vertilock = _Lock()
+        _vertiflg = False
+        _downflg = False
+        _connect_lock = _Lock()
+
+        def _vertiloop() -> None:
+            while True:
+                with _vertilock:
+                    if not _vertiflg: break
+                msgb: MsgBag = _vertiq.get()
+                if msgb.sys_sign == 'sockend':
+                    if msgb.checkTag('VERTIFIED'):
+                        with _connect_lock:
+                            if msgb.getValue() == 'recv':
+                                _msgq_map.pop(msgb.navigate, None)
+                                _connect_map[msgb.navigate].work(_recvq)
+                            elif msgb.getValue() == 'send':
+                                _connect_map[msgb.navigate].work(_msgq_map[msgb.navigate])
+                    elif msgb.checkTag('CLOSED'):
+                        with _connect_lock:
+                            _msgq_map.pop(msgb.navigate, None)
+                            _connect_map.pop(msgb.navigate, None)
+                        _hubq.put(MsgBag(['SOCKOUT'], msgb.navigate, sys_sign = 'socketcell'))
+        
+        def _download() -> None:
+            while True:
+                with _downlock:
+                    if not _downflg: break
+                msgb: MsgBag = _recvq.get()
+                if msgb.sys_sign == 'sockend':
+                    with _connect_lock:
+                        _msgq_map.pop(msgb.navigate, None)
+                        _connect_map.pop(msgb.navigate, None)
+                    _hubq.put(MsgBag(['SOCKOUT'], msgb.navigate, sys_sign = 'socketcell'))
+                elif msgb.sys_sign == 'apps':
+                    _hubq.put(msgb)
+
+        with _downlock: _downflg = True
+        with _vertilock: _vertiflg = True
+        _vertithread = _Thread(target = _vertiloop)
+        _vertithread.start()
+        _downthread = _Thread(target = _download)
+        _downthread.start()
+
         while True:
-            with self._run_lock:
-                if not self._running_flg:
-                    pass
-            msg_bag: MsgBag = self._cellq.get()
+            with _run_lock:
+                if not _running_flg:
+                    with _downlock: _downflg = False
+                    for item in _connect_map.items():
+                        item[1].stopWork()
+            msg_bag: MsgBag = _cellq.get()
+            if msg_bag.sys_sign == 'sockethub' and msg_bag.checkTag('SOCKIN'):
+                _dt = msg_bag.getValue()
+                msgq = ThreadQueue()
+                _tc = Connection(_dt[0], 'server', msg_bag.navigate, _dt[1], _encoder)
+                with _connect_lock:
+                    _connect_map[msg_bag.navigate] = _tc
+                    _msgq_map[msg_bag.navigate] = msgq
+                _tc.vertify(True, _vertiq)
+            elif msg_bag.sys_sign == 'apps':
+                _msgq_map[msg_bag.navigate].put(msg_bag)
 
     def stop(self) -> None:
         with self._run_lock: self._running_flg = False
 
     def run(self) -> None:
         with self._run_lock: self._running_flg = True
-        self._process = Process(target = self._service)
+        self._process = Process(target = self._service, args = (self._running_flg, self._run_lock, self._hubq,
+                                                                self._cellq, self._maxsize, self._maxrate, 
+                                                                self._logger, self._encoder))
         self._process.start()
 
-# TODO: Only Designed for Server
-# Manage Socket Cells
-# Distribute Sockets
-# Distributes Bag from Services
-# Send back Bags & Manage registered Services
 class SocketHub:
-    def __init__(self, cfg: Config, logger: _LogW, logL: _List[_LogW]) -> None:
+    def __init__(self, cfg: Config, logger: _LogW, logL: _List[_LogW], encoder: _Any) -> None:
         self._inputq: Queue = Queue()
         self._outputq: ThreadQueue = ThreadQueue()
         self._hub_queue: Queue = Queue()
@@ -543,10 +599,12 @@ class SocketHub:
         self._max_cell: int = cfg.queryConfig('maxcell')
         self._maxrate: int = cfg.queryConfig('maxrate')
         self._core_key: int = cfg.queryConfig('corekey')
+        self._key_len: int = cfg.queryConfig('keylen')
         self._use_ipv6: bool = cfg.queryConfig('ipv6')
         self._logger: _LogW = logger
         self._logL: _List[_LogW] = logL
         self._sid_iter = 0
+        self._encoder = encoder
 
     def _uploadloop(self) -> None:
         while True:
@@ -561,23 +619,24 @@ class SocketHub:
             with self._dist_lock:
                 if not self._dist_run: break
             mbag: MsgBag = self._hub_queue.get()
-            if mbag.sys_sign == 'sock_control' and mbag.checkTag('SOCKOUT'):
+            if mbag.sys_sign == 'socketcell' and mbag.checkTag('SOCKOUT'):
                 with self._alive_lock:
                     self._alive_list[self._sid_cid_map[mbag.getValue()]] -= 1
                     self._sid_cid_map.pop(mbag.getValue())
-            else:
+            elif mbag.sys_sign == 'apps':
                 self._outputq.put(mbag)
 
     def _hubloop(self) -> None:
         sock_queue = ThreadQueue()
         for addr in self._bind_addresses:
-            ct = ConnectionTunnel(addr, self._core_key, self._use_ipv6)
+            ct = ConnectionTunnel(addr, self._core_key, self._key_len, self._use_ipv6)
             ct.acceptLoop(sock_queue)
             self._ctunnels.append(ct)
         
         for index in range(self._max_cell):
             celq = Queue()
-            cel = SocketCell(celq, self._hub_queue, index, self._maxrate, self._max_con_per_cell, self._logL[index])
+            cel = SocketCell(celq, self._hub_queue, index, self._maxrate, self._max_con_per_cell, 
+                             self._logL[index], self._encoder)
             self._cellist.append(cel)
             self._cellqs.append(celq)
             self._alive_list.append(0)
@@ -601,11 +660,12 @@ class SocketHub:
                             minn = self._alive_list[index]
                             miniter = index
                     if self._alive_list[miniter] < self._max_con_per_cell:
-                        self._cellqs[miniter].put(MsgBag(['SOCKIN'], (sock_bag.getValue(), self._sid_iter), sys_sign = 'cellcmd'))
+                        self._cellqs[miniter].put(MsgBag(['SOCKIN'], (*sock_bag.getValue(), ), sys_sign = 'sockethub', 
+                                                         navigate = self._sid_iter))
                         self._alive_list[miniter] += 1
                         self._sid_cid_map[self._sid_iter] = miniter
                         self._sid_iter += 1
-                    else: new_sock.close()            
+                    else: new_sock.close()
     
     def terminateLoop(self) -> None:
         with self._running_lock: self._hub_running = False
@@ -625,3 +685,7 @@ class SocketHub:
 
     def getIOqueue(self) -> _Tuple[Queue, ThreadQueue]:
         return self._inputq, self._outputq
+
+class Server:
+    def __init__(self, sh_cfg: Config, tcps_cfg: Config) -> None:
+        _sh = SocketHub()
