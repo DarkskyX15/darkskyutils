@@ -238,6 +238,7 @@ class Packeter:
             return None
         else: return obj
 
+# Speciallize Client side connection
 class Connection:
     def __init__(self, socket: _socket, side: _Literal['send', 'recv', 'server'],
                  sid: int = None, addr: _Tuple[str, int] = None, encoder: _Any = None) -> None:
@@ -823,3 +824,7 @@ class Server:
         self._dist_thread = _Thread(target = self._distribute)
         self._dist_thread.start()
         return self._inputq
+
+# Make Client
+class Client:
+    pass
