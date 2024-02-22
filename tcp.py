@@ -1,12 +1,12 @@
 # -*- coding: UTF-8 -*-
 r'''TCP相关的工具'''
-from os import cpu_count as _cpu_count
+from pickle import loads as _ploads, dumps as _pdumps
 from time import sleep as _slp
 from typing import Literal as _Literal, Any as _Any, Union as _Union, Tuple as _Tuple, List as _List, Dict as _Dict
 from json import dumps as _dumps, loads as _loads
 from sky_lib.encrypt import AES as _AES, RSA as _RSA, RSAKeyPair as _KeyPair, SimpleVertify as _SV, RandomStr as _RS
 from sky_lib.logger import LoggerWrapper as _LogW, ProcessLogger as _PL
-from sky_lib.config import Config, CONFIGTYPE
+from sky_lib.config import Config
 from socket import socket as _socket, AF_INET, AF_INET6, SOCK_STREAM
 from base64 import b64decode as _b64de, b64encode as _b64en
 from multiprocessing import Process, Queue, Value, Lock as _PLock
@@ -59,14 +59,10 @@ class AESCoder(Coder):
         self.name = 'AESCoder'
 
     def decrypt(self, data: bytes, key: bytes = None) -> _Union[bytes, None]:
-        res = self.aes.decrypt(data, key)
-        res = None if res[0] == None else _b64de(res[0])
-        return res
+        return self.aes.decrypt(data, key)[0]
 
     def encrypt(self, data: bytes, key: bytes = None) -> _Union[bytes, None]:
-        res = self.aes.encrypt(data, key)
-        res = None if res[0] == None else _b64en(res[0])
-        return res
+        return self.aes.encrypt(data, key)[0]
 
 class RSACoder(Coder):
     r'''
@@ -78,12 +74,10 @@ class RSACoder(Coder):
         self.name = 'RSACoder'
     
     def decrypt(self, data: bytes, key: bytes = None) -> _Union[bytes, None]:
-        res = self.rsa.decrypt(data)
-        return None if res == None else _b64de(res)
+        return self.rsa.decrypt(data)
     
-    def encrypt(self, data: bytes, key: bytes = None) -> bytes | None:
-        res = self.rsa.encrypt(data)
-        return None if res == None else _b64en(res)
+    def encrypt(self, data: bytes, key: bytes = None) -> _Union[bytes, None]:
+        return self.rsa.encrypt(data)
 
 class MsgBag:
     r'''
@@ -132,17 +126,26 @@ class Packeter:
         self._logw = logger
 
 
-    def sendPacket(self, client: _socket, obj: object, key: bytes = None) -> bool:
+    def sendPacket(self, client: _socket, obj: object, key: bytes = None, pickle: bool = False) -> bool:
         r'''
         将`obj`通过`client`发送.
         参数说明:
         - `client`: TCP链接的`socket`对象
-        - `obj`: 需要发送的对象(任意可被转成JSON字符串的对象)
+        - `obj`: 需要发送的对象
         - `key`: 加密时使用的密钥
+        - `pickle`: 若为真，将`obj`序列化后发送，否则使用json转换对象
         '''
-        try:
-            send_data = _dumps(obj).encode('utf-8')
-            coded = self._encoder.encrypt(send_data, key)
+        if not pickle:
+            try: send_data = _dumps(obj).encode('utf-8')
+            except Exception as e:
+                if self._error == 'strict': raise PacketError('Fail JSON', e.args)
+                else:
+                    err = PacketError('Fail JSON', e.args)
+                    if self._use_logger: self._logw.error(err)
+                    else: print(err)
+                return False
+        else: send_data = _pdumps(obj, fix_imports = False)
+        try: coded = self._encoder.encrypt(send_data, key)
         except Exception as e:
             e_str = f'Can not encode data with \'{self._encoder.name}\' while sending packet: '
             if self._error == 'strict': raise PacketError(e_str, e.args)
@@ -177,8 +180,6 @@ class Packeter:
                 send_data_size -= 1024
                 send_data_pointer += 1024
             return True
-        except TimeoutError as e:
-            raise e
         except Exception as e:
             e_str = 'Error occurred during sending process: '
             if self._error == 'strict': raise PacketError(e_str, e.args)
@@ -189,12 +190,13 @@ class Packeter:
                 else: print(err)
             return False
 
-    def recvPacket(self, client: _socket, key: bytes = None) -> _Any:
+    def recvPacket(self, client: _socket, key: bytes = None, pickle: bool = False) -> _Any:
         r'''
         通过`client`接收信息.
         参数说明:
         - `client`: TCP链接的`socket`对象
         - `key`: 解密时使用的密钥
+        - `pickle`: 若为真，将接收数据反序列化，否则使用json复原对象
         '''
         try:
             size = 0
@@ -212,8 +214,6 @@ class Packeter:
                     recv_size = 1024
                 pack_ += client.recv(recv_size)
                 size = len(pack_)
-        except TimeoutError as e:
-            raise e
         except Exception as e:
             e_str = 'Error occurred during recv process: '
             if self._error == 'strict': raise PacketError(e_str, e.args)
@@ -224,9 +224,7 @@ class Packeter:
                 else: print(err)
             return None
         
-        try:
-            decoded = self._encoder.decrypt(pack_, key)
-            obj = _loads(decoded.decode('utf-8'))
+        try: decoded = self._encoder.decrypt(pack_, key)
         except Exception as e:
             e_str = f'Can not decode packet with \'{self._encoder.name}\' while recving: '
             if self._error == 'strict': raise PacketError(e_str, e.args)
@@ -236,12 +234,23 @@ class Packeter:
                 if self._use_logger: self._logw.error(err)
                 else: print(err)
             return None
-        else: return obj
+        else:
+            if not pickle:
+                try: obj = _loads(decoded.decode('utf-8'))
+                except Exception as e:
+                    if self._error == 'strict': raise PacketError('Fail JSON', e.args)
+                    else:
+                        err = PacketError('Fail JSON', e.args)
+                        if self._use_logger: self._logw.error(err)
+                        else: print(err)
+                    return None
+            else: obj = _ploads(decoded, fix_imports = False)
+            return obj
 
 # Speciallize Client side connection
 class Connection:
     def __init__(self, socket: _socket, side: _Literal['send', 'recv', 'server'],
-                 sid: int = None, addr: _Tuple[str, int] = None, encoder: _Any = None) -> None:
+                 sid: int = None, addr: _Tuple[str, int] = None, encoder: _Any = None, pk: bool = False) -> None:
         self._socket = socket
         self._sid = sid
         if sid != None: self._sign = 'CONNECT{}'.format(sid)
@@ -251,13 +260,15 @@ class Connection:
         self._codeclass = AESCoder if encoder == None else encoder
         self._working_thread = None
         self._vertify_thread = None
-        self._side: _Literal['send', 'recv', 'server'] = side
+        self._side: _Literal['ssend', 'srecv', 'server', 'recv', 'send'] = side
         self._msgq: ThreadQueue = None
         self._workq: ThreadQueue = None
         self._status: _Literal['CLOSED', 'BAD', 'VERTIFY', 'NORM', 'ERR'] = 'BAD'
         self._status_lock = _Lock()
-        self._working_flg = False
-        self._work_lock = _Lock()
+        self._working_flg = None
+        self._work_lock = None
+        self._work_mode: _Literal['process', 'thread'] = None
+        self._allowpk = pk
     
     def _vertifySocketAsServer(self) -> bool:
         try: self._socket.sendall(b'----VERITIFY----')
@@ -289,7 +300,7 @@ class Connection:
                 self._packter = Packeter(self._coder, 'strict')
                 self._packter.sendPacket(self._socket, [self._sid, self._addr])
                 self._side = self._packter.recvPacket(self._socket)
-                self._side = 'recv' if self._side == 'send' else 'send'
+                self._side = 'srecv' if self._side == 'send' else 'ssend'
         return True
 
     def _vertifySocketAsClient(self) -> bool:
@@ -341,13 +352,13 @@ class Connection:
         self._socket.settimeout(8.0)
         while True:
             with self._work_lock:
-                if not self._working_flg:
+                if (self._work_mode == 'thread' and (not self._working_flg)) or \
+                    (self._work_mode == 'process' and (not self._working_flg.value)):
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
                     self._workq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
-            try:
-                msg = self._packter.recvPacket(self._socket)
+            try: msg = self._packter.recvPacket(self._socket, pickle = self._allowpk)
             except Exception:
                 self._socket.close()
                 with self._status_lock: self._status = 'ERR'
@@ -366,7 +377,8 @@ class Connection:
         self._socket.settimeout(8.0)
         while True:
             with self._work_lock:
-                if not self._working_flg:
+                if (self._work_mode == 'thread' and (not self._working_flg)) or \
+                    (self._work_mode == 'process' and (not self._working_flg.value)):
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
                     self._workq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
@@ -380,7 +392,7 @@ class Connection:
                     self._workq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
             else:
-                try: self._packter.sendPacket(self._socket, pbag.getValue())
+                try: self._packter.sendPacket(self._socket, pbag.getValue(), pickle = self._allowpk)
                 except Exception:
                     self._socket.close()
                     with self._status_lock: self._status = 'ERR'
@@ -391,17 +403,30 @@ class Connection:
                     with self._status_lock: self._status = 'CLOSED'
                     self._workq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sockend', navigate = self._sid))
 
-    def work(self, msgQ: ThreadQueue) -> None:
+    def work(self, msgQ: _Union[ThreadQueue, Queue], work_mode: _Literal['process', 'thread'] = 'thread') -> None:
         self._workq = msgQ
-        if self._side == 'recv':
-            self._working_thread = _Thread(target = self._work_as_recv)
-        elif self._side == 'send':
-            self._working_thread = _Thread(target = self._work_as_send)
+        self._work_mode = work_mode
+        if work_mode == 'process':
+            self._work_lock = _PLock()
+            self._working_flg = Value('b', True, lock = False)
+        else:
+            self._work_lock = _Lock()
+            self._working_flg = True
+        if self._side == 'srecv' or self._side == 'recv':
+            if work_mode == 'thread':
+                self._working_thread = _Thread(target = self._work_as_recv)
+            else: self._working_thread = Process(target = self._work_as_recv)
+        elif self._side == 'ssend' or self._side == 'send':
+            if work_mode == 'thread':
+                self._working_thread = _Thread(target = self._work_as_send)
+            else: self._working_thread = Process(target = self._work_as_send)
         with self._work_lock: self._working_flg = True
         self._working_thread.start()
 
     def stopWork(self) -> None:
-        with self._work_lock: self._working_flg = False
+        with self._work_lock:
+            if self._work_mode == 'thread': self._working_flg = False
+            else: self._working_flg.value = False
 
     def getStatus(self) -> None:
         with self._status_lock: return self._status
@@ -502,7 +527,7 @@ class ConnectionTunnel:
 
 class SocketCell:
     def __init__(self, cell_queue: Queue, hub_queue: Queue, cell_id: int, maxrate: int, 
-                 max_size: int, logger: _LogW, encoder: _Any) -> None:
+                 max_size: int, logger: _LogW, encoder: _Any, pk: bool) -> None:
         self._cellq = cell_queue
         self._hubq = hub_queue
         self._process = None
@@ -514,10 +539,11 @@ class SocketCell:
         self._logger = logger
         self._mnlg = logger.getWrapperInstance('baseloop')
         self._encoder = encoder
+        self._use_pickle = pk
 
     @staticmethod
     def _service(_running_flg, _run_lock, _hubq: Queue, _cellq: Queue, _maxsize, _maxrate, 
-                 _logger: _LogW, _encoder, _vertilg: _LogW, _downlg: _LogW) -> None:
+                 _logger: _LogW, _encoder, _vertilg: _LogW, _downlg: _LogW, use_pk: bool) -> None:
         _vertiq = ThreadQueue()
         _connect_map: _Dict[int, Connection] = {}
         _msgq_map: _Dict[int, ThreadQueue] = {}
@@ -541,10 +567,10 @@ class SocketCell:
                         if msgb.checkTag('VERTIFIED'):
                             _vertilg.info('Socket vertified, ID:', msgb.navigate)
                             with _connect_lock:
-                                if msgb.getValue() == 'recv':
+                                if msgb.getValue() == 'srecv':
                                     _msgq_map.pop(msgb.navigate, None)
                                     _connect_map[msgb.navigate].work(_recvq)
-                                elif msgb.getValue() == 'send':
+                                elif msgb.getValue() == 'ssend':
                                     _connect_map[msgb.navigate].work(_msgq_map[msgb.navigate])
                         elif msgb.checkTag('CLOSED'):
                             _vertilg.info('Socket blocked, ID:', msgb.navigate)
@@ -600,7 +626,7 @@ class SocketCell:
                     _logger.info('Recv new socket from sockethub, ID:', msg_bag.navigate)
                     _dt = msg_bag.getValue()
                     msgq = ThreadQueue()
-                    _tc = Connection(_dt[0], 'server', msg_bag.navigate, _dt[1], _encoder)
+                    _tc = Connection(_dt[0], 'server', msg_bag.navigate, _dt[1], _encoder, use_pk)
                     with _connect_lock:
                         _connect_map[msg_bag.navigate] = _tc
                         _msgq_map[msg_bag.navigate] = msgq
@@ -619,7 +645,7 @@ class SocketCell:
         self._process = Process(target = SocketCell._service, args = (self._running_flg, self._run_lock, self._hubq,
                                                                 self._cellq, self._maxsize, self._maxrate, 
                                                                 self._mnlg, self._encoder, self._logger.getWrapperInstance('auth'), 
-                                                                self._logger.getWrapperInstance('bkward')))
+                                                                self._logger.getWrapperInstance('bkward'), self._use_pickle))
         self._logger.info('SocketCell start!')
         self._process.start()
 
@@ -650,6 +676,7 @@ class SocketHub:
         self._core_key: int = cfg.queryConfig('corekey')
         self._key_len: int = cfg.queryConfig('keylen')
         self._use_ipv6: bool = cfg.queryConfig('ipv6')
+        self._use_pickle: bool = cfg.queryConfig('use_pickle')
         self._logger: _LogW = logger
         self._logL: _List[_LogW] = logL
         self._logCT: _List[_LogW] = [logger.getWrapperInstance('CTunnel{}'.format(index)) for index in range(len(self._bind_addresses))]
@@ -667,6 +694,7 @@ class SocketHub:
         _cfg.setConfig('corekey', 135)
         _cfg.setConfig('keylen', 64)
         _cfg.setConfig('ipv6', False)
+        _cfg.setConfig('use_pickle', False)
         return _cfg
 
     def _uploadloop(self) -> None:
@@ -710,7 +738,7 @@ class SocketHub:
             self._mnlg.info('Start SocketCell', index, 'on seperated Process.')
             celq = Queue()
             cel = SocketCell(celq, self._hub_queue, index, self._maxrate, self._max_con_per_cell, 
-                             self._logL[index], self._encoder)
+                             self._logL[index], self._encoder, self._use_pickle)
             self._cellist.append(cel)
             self._cellqs.append(celq)
             self._alive_list.append(0)
@@ -773,6 +801,14 @@ class SocketHub:
     def getIOqueue(self) -> _Tuple[Queue, ThreadQueue]:
         return self._inputq, self._outputq
 
+class ServicePort:
+    def __init__(self, service_name: str, msgq: Queue) -> None:
+        self._name = service_name
+        self._msgq = msgq
+    
+    def putMsg(self, tags: _List[str], val: _Any, target_sid: int) -> None:
+        self._msgq.put(MsgBag(tags, [self._name, val], sys_sign = 'apps', navigate = target_sid))
+
 class Server:
     def __init__(self, sh_cfg: Config, plogger: _PL, encoder: _Any = AESCoder) -> None:
         _cell_cnt = sh_cfg.queryConfig('maxcell')
@@ -806,15 +842,17 @@ class Server:
                         self._service_map[ser].put(MsgBag(['STOP'], None, sys_sign = 'server'))
                     break
     
-    def bindService(self, name: str, msgq: Queue) -> None:
+    def bindService(self, name: str, msgq: Queue) -> ServicePort:
+        self._slg.info('Bind service:', name)
         self._service_map[name] = msgq
         self._serve_name.append(name)
+        return ServicePort(name, self._inputq)
 
     def stopServer(self) -> None:
         self._slg.warn('Actively close server!')
         with self._runlock: self._running = False
 
-    def runServer(self) -> Queue:
+    def runServer(self) -> None:
         self._slg.info('Server start!')
         with self._runlock: self._running = True
         self._slg.info('Start SocketHub.')
@@ -823,7 +861,6 @@ class Server:
         self._slg.info('Start bag distributing Thread.')
         self._dist_thread = _Thread(target = self._distribute)
         self._dist_thread.start()
-        return self._inputq
 
 # Make Client
 class Client:
