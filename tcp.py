@@ -1,7 +1,7 @@
 # -*- coding: UTF-8 -*-
 r'''TCP相关的工具'''
 from pickle import loads as _ploads, dumps as _pdumps
-from time import sleep as _slp
+from time import sleep as _slp, perf_counter as _pfcnt
 from typing import Literal as _Literal, Any as _Any, Union as _Union, Tuple as _Tuple, List as _List, Dict as _Dict
 from json import dumps as _dumps, loads as _loads
 from sky_lib.encrypt import AES as _AES, RSA as _RSA, RSAKeyPair as _KeyPair, SimpleVertify as _SV, RandomStr as _RS
@@ -91,7 +91,7 @@ class MsgBag:
         for tag in tags:
             self._tags[tag] = True
     def __str__(self) -> str:
-        return 'Tags:{} Value:{}'.format(tuple(self._tags.keys()), self._val)
+        return 'Tags:{} Value:{} SYS:{} NVG:{}'.format(tuple(self._tags.keys()), self._val, self.sys_sign, self.navigate)
 
     def getValue(self) -> _Any:
         return self._val
@@ -247,7 +247,7 @@ class Packeter:
             else: obj = _ploads(decoded, fix_imports = False)
             return obj
 
-# Speciallize Client side connection
+
 class Connection:
     def __init__(self, socket: _socket, side: _Literal['send', 'recv', 'server'],
                  sid: int = None, addr: _Tuple[str, int] = None, encoder: _Any = None, pk: bool = False) -> None:
@@ -365,12 +365,13 @@ class Connection:
                 self._workq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
                 break
             else:
-                if isinstance(msg, str) and msg == 'HEARTBEAT': pass
-                if isinstance(msg, str) and msg == 'CLOSE':
-                    self._socket.close()
-                    with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['C_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
-                else:
+                if isinstance(msg, str):
+                    if msg == 'HEARTBEAT': pass
+                    if msg == 'CLOSE':
+                        self._socket.close()
+                        with self._status_lock: self._status = 'CLOSED'
+                        self._workq.put(MsgBag(['C_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
+                elif isinstance(msg, list):
                     self._workq.put(MsgBag([self._sign, msg[0]], msg[1], sys_sign = 'apps', navigate = self._sid))
 
     def _work_as_send(self) -> None:
@@ -547,12 +548,15 @@ class SocketCell:
         _vertiq = ThreadQueue()
         _connect_map: _Dict[int, Connection] = {}
         _msgq_map: _Dict[int, ThreadQueue] = {}
+        _rate_map: _Dict[int, int] = {}
+        _rate_time_map: _Dict[int, float] = {}
         _recvq = ThreadQueue()
         _downlock = _Lock()
         _vertilock = _Lock()
         _vertiflg = False
         _downflg = False
         _connect_lock = _Lock()
+        _rate_lock = _Lock()
 
         def _vertiloop() -> None:
             while True:
@@ -574,6 +578,9 @@ class SocketCell:
                                     _connect_map[msgb.navigate].work(_msgq_map[msgb.navigate])
                         elif msgb.checkTag('CLOSED'):
                             _vertilg.info('Socket blocked, ID:', msgb.navigate)
+                            with _rate_lock:
+                                _rate_map.pop(msgb.navigate, None)
+                                _rate_time_map.pop(msgb.navigate, None)
                             with _connect_lock:
                                 _msgq_map.pop(msgb.navigate, None)
                                 _connect_map.pop(msgb.navigate, None)
@@ -595,6 +602,15 @@ class SocketCell:
                         _hubq.put(MsgBag(['SOCKOUT'], msgb.navigate, sys_sign = 'socketcell'))
                         _downlg.info('Socket out, ID:', msgb.navigate, ', send it to sockethub.')
                     elif msgb.sys_sign == 'apps':
+                        if _maxrate > 0:
+                            with _rate_lock:
+                                _rate_map[msgb.navigate] += 1
+                                if _rate_map[msgb.navigate] > _maxrate:
+                                    _downlg.warn('Socket sending too many packets, ID:', msgb.navigate)
+                                    _connect_map[msgb.navigate].stopWork()
+                                if _pfcnt() - _rate_time_map[msgb.navigate] > 1.0:
+                                    _rate_map[msgb.navigate] = 0
+                                _rate_time_map[msgb.navigate] = _pfcnt()
                         _hubq.put(msgb)
 
         with _downlock: _downflg = True
@@ -627,6 +643,9 @@ class SocketCell:
                     _dt = msg_bag.getValue()
                     msgq = ThreadQueue()
                     _tc = Connection(_dt[0], 'server', msg_bag.navigate, _dt[1], _encoder, use_pk)
+                    with _rate_lock:
+                        _rate_time_map[msg_bag.navigate] = _pfcnt()
+                        _rate_map[msg_bag.navigate] = 0
                     with _connect_lock:
                         _connect_map[msg_bag.navigate] = _tc
                         _msgq_map[msg_bag.navigate] = msgq
@@ -686,6 +705,7 @@ class SocketHub:
         self._rvlg = logger.getWrapperInstance('reverseloop')
         self._mnlg = logger.getWrapperInstance('mainloop')
 
+    @staticmethod
     def exportDefaultCfg(cfg_name: str) -> Config:
         _cfg = Config(cfg_name)
         _cfg.setConfig('bind_addr', [['127.0.0.1', 4448], ['127.0.0.1', 41919]])
@@ -801,6 +821,7 @@ class SocketHub:
     def getIOqueue(self) -> _Tuple[Queue, ThreadQueue]:
         return self._inputq, self._outputq
 
+
 class ServicePort:
     def __init__(self, service_name: str, msgq: Queue) -> None:
         self._name = service_name
@@ -823,6 +844,8 @@ class Server:
         self._running = False
         self._runlock = _Lock()
 
+        if sh_cfg.queryConfig('use_pickle'):
+            self._slg.warn('Pickle is allowed, this may cause dangerous code execution during network operations!') 
         self._slg.info('Server inited with SH config:', sh_cfg)
         self._slg.info('Using encoder:', encoder.name)
     
@@ -862,6 +885,62 @@ class Server:
         self._dist_thread = _Thread(target = self._distribute)
         self._dist_thread.start()
 
-# Make Client
+
+class ClientPort:
+    def __init__(self, sid: int, msgq: Queue) -> None:
+        self._sid = sid
+        self._q = msgq
+    
+    def getMsg(self) -> MsgBag:
+        return self._q.get()
+
+    def putMsg(self, val: _Any, target_service: str) -> None:
+        self._q.put(MsgBag([], [target_service, val]))
+
 class Client:
-    pass
+    def __init__(self, cli_cfg: Config, encoder: _Any = None) -> None:
+        self._corekey = cli_cfg.queryConfig('corekey')
+        self._keylen = cli_cfg.queryConfig('keylen')
+        self._ipv6 = cli_cfg.queryConfig('ipv6')
+        self._usepk = cli_cfg.queryConfig('use_pickle')
+        self._coder = encoder
+        self._connect_map: _Dict[int, Connection] = {}
+        self._sendqlist: _List[Queue] = []
+        self._recvqlist: _List[Queue] = []
+        self._vertiq = ThreadQueue()
+    
+    @staticmethod
+    def exportDefaultCfg(cfg_name: str) -> Config:
+        cfg = Config(cfg_name)
+        cfg.setConfig('corekey', 135)
+        cfg.setConfig('keylen', 64)
+        cfg.setConfig('ipv6', False)
+        cfg.setConfig('use_pickle', False)
+        return cfg
+
+    def stopClient(self) -> None:
+        for _q in self._sendqlist:
+            _q.put(MsgBag(['CMD'], 'CLOSE'))
+
+    def connect(self, addr: _Tuple[str, int], side: _Literal['recv', 'send']) -> _Union[ClientPort, None]:
+        sock = _socket(AF_INET, SOCK_STREAM)
+        connect = Connection(sock, side, encoder = self._coder, pk = self._usepk)
+        sock.settimeout(5.0)
+        sock.connect(addr)
+        sock.sendall(_SV(self._corekey, self._keylen).generateBytes())
+        connect.vertify(False, self._vertiq)
+        res: MsgBag = self._vertiq.get(True, 2.0)
+        if res.checkTag('VERTIFIED'):
+            if side == 'send':
+                inputq = Queue()
+                connect.work(inputq, 'process')
+                self._connect_map[res.navigate] = connect
+                self._sendqlist.append(inputq)
+                return ClientPort(res.navigate, inputq)
+            elif side == 'recv':
+                outputq = Queue()
+                connect.work(outputq, 'process')
+                self._connect_map[res.navigate] = connect
+                self._recvqlist.append(outputq)
+                return ClientPort(res.navigate, outputq)
+        else: return None
