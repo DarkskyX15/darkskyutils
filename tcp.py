@@ -11,7 +11,7 @@ from socket import socket as _socket, AF_INET, AF_INET6, SOCK_STREAM
 from base64 import b64decode as _b64de, b64encode as _b64en
 from multiprocessing import Process, Queue, Value, Lock as _PLock
 from threading import Thread as _Thread, Lock as _Lock
-from queue import Empty, Full, Queue as ThreadQueue
+from queue import Empty, Queue as ThreadQueue
 
 SERVING_SIDE = _Literal['server', 'client']
 SYS_SIGN = _Literal['sockend', 'socketcell', 'sockethub', 'ctunnel', 'apps', 'server']
