@@ -262,6 +262,7 @@ class Connection:
         self._vertify_thread = None
         self._side: _Literal['ssend', 'srecv', 'server', 'recv', 'send'] = side
         self._msgq: ThreadQueue = None
+        self._bkq: ThreadQueue = None
         self._workq: ThreadQueue = None
         self._status: _Literal['CLOSED', 'BAD', 'VERTIFY', 'NORM', 'ERR'] = 'BAD'
         self._status_lock = _Lock()
@@ -281,9 +282,6 @@ class Connection:
             self._socket.close()
             return False
         else:
-            if len(pkey) != 2048:
-                self._socket.close()
-                return False
             self._socket.settimeout(None)
             rsakp = _KeyPair(pkey)
             rsacod = _RSA(rsakp, 'loose')
@@ -318,12 +316,12 @@ class Connection:
             self._socket.close()
             return False
         rsacod = _RSA(rsap, 'loose')
-        try: aes_r = self._socket.recv(32)
+        try: aes_r = self._socket.recv(256)
         except Exception:
             self._socket.close()
             return False
         else:
-            if len(aes_r) != 32:
+            if len(aes_r) != 256:
                 self._socket.close()
                 return False
         aes_r = rsacod.decrypt(aes_r)
@@ -371,6 +369,7 @@ class Connection:
                         self._socket.close()
                         with self._status_lock: self._status = 'CLOSED'
                         self._workq.put(MsgBag(['C_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
+                        break
                 elif isinstance(msg, list):
                     self._workq.put(MsgBag([self._sign, msg[0]], msg[1], sys_sign = 'apps', navigate = self._sid))
 
@@ -382,7 +381,7 @@ class Connection:
                     (self._work_mode == 'process' and (not self._working_flg.value)):
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
+                    self._bkq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
             try: pbag: MsgBag = self._workq.get(True, 5.0)
             except Empty:
@@ -390,22 +389,24 @@ class Connection:
                 except Exception:
                     self._socket.close()
                     with self._status_lock: self._status = 'ERR'
-                    self._workq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
+                    self._bkq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
             else:
                 try: self._packter.sendPacket(self._socket, pbag.getValue(), pickle = self._allowpk)
                 except Exception:
                     self._socket.close()
                     with self._status_lock: self._status = 'ERR'
-                    self._workq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
+                    self._bkq.put(MsgBag(['ERR'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
                 if pbag.checkTag('CMD') and pbag.getValue() == 'CLOSE':
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
-                    self._workq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sockend', navigate = self._sid))
+                    self._bkq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sockend', navigate = self._sid))
+                    break
 
-    def work(self, msgQ: _Union[ThreadQueue, Queue], work_mode: _Literal['process', 'thread'] = 'thread') -> None:
+    def work(self, msgQ: _Union[ThreadQueue, Queue], bkQ: _Any = None, work_mode: _Literal['process', 'thread'] = 'thread') -> None:
         self._workq = msgQ
+        self._bkq = bkQ
         self._work_mode = work_mode
         if work_mode == 'process':
             self._work_lock = _PLock()
@@ -575,7 +576,7 @@ class SocketCell:
                                     _msgq_map.pop(msgb.navigate, None)
                                     _connect_map[msgb.navigate].work(_recvq)
                                 elif msgb.getValue() == 'ssend':
-                                    _connect_map[msgb.navigate].work(_msgq_map[msgb.navigate])
+                                    _connect_map[msgb.navigate].work(_msgq_map[msgb.navigate], _recvq)
                         elif msgb.checkTag('CLOSED'):
                             _vertilg.info('Socket blocked, ID:', msgb.navigate)
                             with _rate_lock:
@@ -596,11 +597,13 @@ class SocketCell:
                 except Empty: pass
                 else:
                     if msgb.sys_sign == 'sockend':
+                        if msgb.checkTag('C_CLOSE'): info = 'client-side close'
+                        elif msgb.checkTag('ERR'): info = 'error & closed'
                         with _connect_lock:
                             _msgq_map.pop(msgb.navigate, None)
                             _connect_map.pop(msgb.navigate, None)
                         _hubq.put(MsgBag(['SOCKOUT'], msgb.navigate, sys_sign = 'socketcell'))
-                        _downlg.info('Socket out, ID:', msgb.navigate, ', send it to sockethub.')
+                        _downlg.info(f'Socket {info}, ID:', msgb.navigate, ', send it to sockethub.')
                     elif msgb.sys_sign == 'apps':
                         if _maxrate > 0:
                             with _rate_lock:
@@ -789,10 +792,10 @@ class SocketHub:
                                 miniter = index
                         if self._alive_list[miniter] < self._max_con_per_cell:
                             self._mnlg.info('New socket placed in Cell', miniter)
-                            self._cellqs[miniter].put(MsgBag(['SOCKIN'], (*sock_bag.getValue(), ), sys_sign = 'sockethub', 
-                                                            navigate = self._sid_iter))
                             self._alive_list[miniter] += 1
                             self._sid_cid_map[self._sid_iter] = miniter
+                            self._cellqs[miniter].put(MsgBag(['SOCKIN'], (*sock_bag.getValue(), ), sys_sign = 'sockethub', 
+                                                            navigate = self._sid_iter))
                             self._sid_iter += 1
                         else:
                             self._mnlg.warn('No spare place for new socket!')
@@ -843,6 +846,7 @@ class Server:
         self._serve_name: _List[str] = []
         self._running = False
         self._runlock = _Lock()
+        self._service_lock = _Lock()
 
         if sh_cfg.queryConfig('use_pickle'):
             self._slg.warn('Pickle is allowed, this may cause dangerous code execution during network operations!') 
@@ -854,21 +858,24 @@ class Server:
             try: msg_bag: MsgBag = self._outputq.get(True, timeout = 2.0)
             except Empty: pass
             else:
-                for serve in self._serve_name:
-                    if msg_bag.checkTag(serve):
-                        self._service_map[serve].put(msg_bag)
+                with self._service_lock:
+                    for serve in self._serve_name:
+                        if msg_bag.checkTag(serve):
+                            self._service_map[serve].put(msg_bag)
             with self._runlock:
                 if not self._running:
                     self._slg.warn('Server stopping, sending stop msg...')
                     self._sh.terminateLoop()
-                    for ser in self._serve_name:
-                        self._service_map[ser].put(MsgBag(['STOP'], None, sys_sign = 'server'))
+                    with self._service_lock:
+                        for ser in self._serve_name:
+                            self._service_map[ser].put(MsgBag(['STOP'], None, sys_sign = 'server'))
                     break
     
     def bindService(self, name: str, msgq: Queue) -> ServicePort:
         self._slg.info('Bind service:', name)
-        self._service_map[name] = msgq
-        self._serve_name.append(name)
+        with self._service_lock:
+            self._service_map[name] = msgq
+            self._serve_name.append(name)
         return ServicePort(name, self._inputq)
 
     def stopServer(self) -> None:
@@ -933,13 +940,13 @@ class Client:
         if res.checkTag('VERTIFIED'):
             if side == 'send':
                 inputq = Queue()
-                connect.work(inputq, 'process')
+                connect.work(inputq, bkQ = outputq, work_mode = 'thread')
                 self._connect_map[res.navigate] = connect
                 self._sendqlist.append(inputq)
                 return ClientPort(res.navigate, inputq)
             elif side == 'recv':
                 outputq = Queue()
-                connect.work(outputq, 'process')
+                connect.work(outputq, work_mode = 'thread')
                 self._connect_map[res.navigate] = connect
                 self._recvqlist.append(outputq)
                 return ClientPort(res.navigate, outputq)
