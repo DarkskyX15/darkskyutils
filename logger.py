@@ -7,8 +7,9 @@ r'''
 #### 只建议将LoggerWrapper实例传入线程/进程
 '''
 from typing import Literal as _Literal, Callable as _Callable, Union as _Union, Any as _Any
-from threading import Thread as _Thread
-from multiprocessing import Queue as _Queue, Process as _Process
+from threading import Thread as _Thread, Lock as _Lock
+from queue import Empty as _Empty
+from multiprocessing import Queue as _Queue, Process as _Process, Lock as _PLock
 from random import randint as _randint
 from time import strftime as _strftime, localtime as _localtime
 from os.path import exists as _exists
@@ -87,7 +88,7 @@ class LoggerWrapper:
         else:
             return LoggerPacket('default', self.phase_name, 'unknown', logs)
         
-    def stopLogger(self, reason: str) -> None:
+    def stopLogger(self, reason: str = 'Normal Exit.') -> None:
         self.pushLog(self.logsPacketer(reason, 'stop'))
 
     def info(self, *logs: _Any, sep: str = ' ') -> None:
@@ -122,6 +123,8 @@ class ProcessLogger:
         self.logs_folder = '.\\Logs' if logs_folder_name == None else logs_folder_name.removesuffix('\\')
         self.log_file_name = ''
         self.file_output = file_output
+        self.stopping = False
+        self.stop_lock = _PLock()
         self.wrapper = LoggerWrapper
 
         if self.file_output:
@@ -133,7 +136,14 @@ class ProcessLogger:
         if self.file_output:
             file_out = open(self.logs_folder + '\\' + self.log_file_name, 'w', encoding = 'utf-8')
         while True:
-            packet: LoggerPacket = self.logs_queue.get()
+            if not self.stopping:
+                packet: LoggerPacket = self.logs_queue.get()
+            else:
+                try: packet: LoggerPacket = self.logs_queue.get(True, 5.0)
+                except _Empty:
+                    if self.file_output: file_out.close()
+                    break
+
             text = packet.getStr()
 
             if self.file_output: file_out.write(text + '\n')
@@ -144,8 +154,8 @@ class ProcessLogger:
             print(text, flush = True)
 
             if packet.level == 'STOP':
-                if self.file_output: file_out.close()
-                break
+                with self.stop_lock:
+                    self.stopping = True
 
     def startLogThread(self) -> None:
         self.logger_thread = _Process(target = self._work)
@@ -167,6 +177,8 @@ class ThreadLogger:
         self.log_file_name = ''
         self.file_output = file_output
         self.wrapper = LoggerWrapper
+        self.stopping = False
+        self.stop_lock = _Lock()
 
         if self.file_output:
             if not _exists(self.logs_folder):
@@ -177,7 +189,14 @@ class ThreadLogger:
         if self.file_output:
             file_out = open(self.logs_folder + '\\' + self.log_file_name, 'w', encoding = 'utf-8')
         while True:
-            packet: LoggerPacket = self.logs_queue.get()
+            if not self.stopping:
+                packet: LoggerPacket = self.logs_queue.get()
+            else:
+                try: packet: LoggerPacket = self.logs_queue.get(True, 5.0)
+                except _Empty:
+                    if self.file_output: file_out.close()
+                    break
+            
             text = packet.getStr()
 
             if self.file_output: file_out.write(text + '\n')
@@ -188,8 +207,8 @@ class ThreadLogger:
             print(text, flush = True)
 
             if packet.level == 'STOP':
-                if self.file_output: file_out.close()
-                break
+                with self.stop_lock:
+                    self.stopping = True
 
     def startLogThread(self) -> None:
         self.logger_thread = _Thread(target = self._work)
