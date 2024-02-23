@@ -266,9 +266,8 @@ class Connection:
         self._workq: ThreadQueue = None
         self._status: _Literal['CLOSED', 'BAD', 'VERTIFY', 'NORM', 'ERR'] = 'BAD'
         self._status_lock = _Lock()
-        self._working_flg = None
-        self._work_lock = None
-        self._work_mode: _Literal['process', 'thread'] = None
+        self._working_flg = False
+        self._work_lock = _Lock()
         self._allowpk = pk
     
     def _vertifySocketAsServer(self) -> bool:
@@ -350,8 +349,7 @@ class Connection:
         self._socket.settimeout(8.0)
         while True:
             with self._work_lock:
-                if (self._work_mode == 'thread' and (not self._working_flg)) or \
-                    (self._work_mode == 'process' and (not self._working_flg.value)):
+                if not self._working_flg:
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
                     self._workq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
@@ -377,8 +375,7 @@ class Connection:
         self._socket.settimeout(8.0)
         while True:
             with self._work_lock:
-                if (self._work_mode == 'thread' and (not self._working_flg)) or \
-                    (self._work_mode == 'process' and (not self._working_flg.value)):
+                if not self._working_flg:
                     self._socket.close()
                     with self._status_lock: self._status = 'CLOSED'
                     self._bkq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
@@ -404,24 +401,13 @@ class Connection:
                     self._bkq.put(MsgBag(['C_CLOSE'], self._sid, sys_sign = 'sockend', navigate = self._sid))
                     break
 
-    def work(self, msgQ: _Union[ThreadQueue, Queue], bkQ: _Any = None, work_mode: _Literal['process', 'thread'] = 'thread') -> None:
+    def work(self, msgQ: _Union[ThreadQueue, Queue], bkQ: _Union[ThreadQueue, Queue] = None) -> None:
         self._workq = msgQ
         self._bkq = bkQ
-        self._work_mode = work_mode
-        if work_mode == 'process':
-            self._work_lock = _PLock()
-            self._working_flg = Value('b', True, lock = False)
-        else:
-            self._work_lock = _Lock()
-            self._working_flg = True
         if self._side == 'srecv' or self._side == 'recv':
-            if work_mode == 'thread':
-                self._working_thread = _Thread(target = self._work_as_recv)
-            else: self._working_thread = Process(target = self._work_as_recv)
+            self._working_thread = _Thread(target = self._work_as_recv)
         elif self._side == 'ssend' or self._side == 'send':
-            if work_mode == 'thread':
-                self._working_thread = _Thread(target = self._work_as_send)
-            else: self._working_thread = Process(target = self._work_as_send)
+            self._working_thread = _Thread(target = self._work_as_send)
         with self._work_lock: self._working_flg = True
         self._working_thread.start()
 
@@ -893,6 +879,7 @@ class Server:
         self._dist_thread.start()
 
 
+# Rewrite client
 class ClientPort:
     def __init__(self, sid: int, msgq: Queue) -> None:
         self._sid = sid
@@ -951,3 +938,5 @@ class Client:
                 self._recvqlist.append(outputq)
                 return ClientPort(res.navigate, outputq)
         else: return None
+# Process do all the work &
+# make it static
