@@ -349,7 +349,7 @@ class Connection:
             self._msgq.put(MsgBag(['CLOSED'], self._side, sys_sign = 'sockend', navigate = self._sid))
 
     def _work_as_recv(self) -> None:
-        self._socket.settimeout(8.0)
+        self._socket.settimeout(5.0)
         while True:
             with self._work_lock:
                 if not self._working_flg:
@@ -375,7 +375,7 @@ class Connection:
                     self._workq.put(MsgBag([self._sign, msg[0]], msg[1], sys_sign = 'apps', navigate = self._sid))
 
     def _work_as_send(self) -> None:
-        self._socket.settimeout(8.0)
+        self._socket.settimeout(5.0)
         while True:
             with self._work_lock:
                 if not self._working_flg:
@@ -383,7 +383,7 @@ class Connection:
                     with self._status_lock: self._status = 'CLOSED'
                     self._bkq.put(MsgBag(['S_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
                     break
-            try: pbag: MsgBag = self._workq.get(True, 5.0)
+            try: pbag: MsgBag = self._workq.get(True, 3.0)
             except Empty:
                 try: self._packter.sendPacket(self._socket, 'HEARTBEAT')
                 except Exception:
@@ -705,6 +705,7 @@ class SocketHub:
         _cfg.setConfig('keylen', 64)
         _cfg.setConfig('ipv6', False)
         _cfg.setConfig('use_pickle', False)
+        _cfg.setConfig('maxrate', 50)
         return _cfg
 
     def _uploadloop(self) -> None:
@@ -900,7 +901,7 @@ class ClientPort:
         self._inputq = inputq
         self._outputq = outputq
         self._lock = _PLock()
-        self._status = Value('b', False, lock = False)
+        self._status = Value('b', True, lock = False)
     
     def getIO(self) -> _Tuple[Queue, Queue]:
         return self._inputq, self._outputq
@@ -1008,7 +1009,7 @@ class Client:
         while True:
             with stop_lock:
                 if not stop_flg.value:
-                    send_connect.stopWork()
+                    inputq.put(MsgBag(['CMD'], 'CLOSE'))
                     recv_connect.stopWork()
                     vertiq.put(MsgBag(['STOPPED'], clid))
                     break
@@ -1036,10 +1037,8 @@ class Client:
                         self._wrappers[vbag.getValue()].setStatus('DIED')
                 elif vbag.checkTag('VSEND'):
                     _logger.info('Connection', vbag.getValue(), 'sending tunnel verified.')
-                    with self._data_lock: self._wrappers[vbag.getValue()].setStatus('NORM')
                 elif vbag.checkTag('VRECV'):
                     _logger.info('Connection', vbag.getValue(), 'recving tunnel verified.')
-                    with self._data_lock: self._wrappers[vbag.getValue()].setStatus('NORM')
 
     def stopClient(self) -> None:
         self._logger.warn('Stopping Client!')
