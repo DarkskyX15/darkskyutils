@@ -202,8 +202,11 @@ class Packeter:
             size = 0
             pack_header = b''
             while size < 2:
-                pack_header += client.recv(2 - size)
-                size = len(pack_header)
+                data = client.recv(2 - size)
+                if not data: raise ConnectionError('peer closed.')
+                else: 
+                    pack_header += data
+                    size = len(pack_header)
             
             size = 0
             pack_size = int.from_bytes(pack_header, 'big')
@@ -347,6 +350,7 @@ class Connection:
 
     def _work_as_recv(self) -> None:
         self._socket.settimeout(8.0)
+        self._socket.setblocking(1)
         while True:
             with self._work_lock:
                 if not self._working_flg:
@@ -412,9 +416,7 @@ class Connection:
         self._working_thread.start()
 
     def stopWork(self) -> None:
-        with self._work_lock:
-            if self._work_mode == 'thread': self._working_flg = False
-            else: self._working_flg.value = False
+        with self._work_lock: self._working_flg = False
 
     def getStatus(self) -> None:
         with self._status_lock: return self._status
@@ -556,7 +558,7 @@ class SocketCell:
                 else:
                     if msgb.sys_sign == 'sockend':
                         if msgb.checkTag('VERTIFIED'):
-                            _vertilg.info('Socket vertified, ID:', msgb.navigate)
+                            _vertilg.info('Socket verified, ID:', msgb.navigate)
                             with _connect_lock:
                                 if msgb.getValue() == 'srecv':
                                     _msgq_map.pop(msgb.navigate, None)
@@ -879,29 +881,56 @@ class Server:
         self._dist_thread.start()
 
 
-# Rewrite client
 class ClientPort:
-    def __init__(self, sid: int, msgq: Queue) -> None:
-        self._sid = sid
-        self._q = msgq
+    def __init__(self, service: str, inputq: Queue, outputq: Queue) -> None:
+        self._service = service
+        self._inputq = inputq
+        self._outputq = outputq
+        self._lock = _PLock()
+        self._status = Value('b', False, lock = False)
     
-    def getMsg(self) -> MsgBag:
-        return self._q.get()
+    def setStatus(self, _sta: _Literal['NORM', 'DIED']) -> None:
+        if _sta == 'NORM':
+            with self._lock: self._status.value = True
+        elif _sta == 'DIED':
+            with self._lock: self._status.value = False
 
-    def putMsg(self, val: _Any, target_service: str) -> None:
-        self._q.put(MsgBag([], [target_service, val]))
+    def getMsg(self, _timeout: float = None) -> _Union[MsgBag, None]:
+        with self._lock:
+            if not self._status.value: return None
+            else:
+                if _timeout != None: return self._outputq.get(True, timeout = _timeout)
+                else: return self._outputq.get()
+
+    def putMsg(self, val: _Any, _timeout: float = None) -> bool:
+        with self._lock:
+            if not self._status.value: return False
+            else:
+                if _timeout != None:
+                    self._inputq.put(MsgBag([], [self._service, val]), True, _timeout)
+                else: self._inputq.put(MsgBag([], [self._service, val]))
+                return True
 
 class Client:
-    def __init__(self, cli_cfg: Config, encoder: _Any = None) -> None:
+    def __init__(self, cli_cfg: Config, plogger: _PL, encoder: _Any = None) -> None:
         self._corekey = cli_cfg.queryConfig('corekey')
         self._keylen = cli_cfg.queryConfig('keylen')
         self._ipv6 = cli_cfg.queryConfig('ipv6')
         self._usepk = cli_cfg.queryConfig('use_pickle')
-        self._coder = encoder
-        self._connect_map: _Dict[int, Connection] = {}
-        self._sendqlist: _List[Queue] = []
-        self._recvqlist: _List[Queue] = []
-        self._vertiq = ThreadQueue()
+        self._coder = encoder if encoder != None else AESCoder
+        self._data_lock = _Lock()
+        self._serve_cons: _Dict[str, Process] = {}
+        self._inputqs: _Dict[str, Queue] = {}
+        self._outputqs: _Dict[str, Queue] = {}
+        self._clid_list: _List[str] = []
+        self._wrappers: _Dict[str, ClientPort] = {}
+        self._stopflgs: _Dict[str, _Any] = {}
+        self._stoplocks: _Dict[str, _Any] = {}
+        self._vertiq = Queue()
+        self._verti_thread = None
+        self._running = False
+        self._run_lock = _Lock()
+        self._logger = plogger.getWarpperInstance('Client')
     
     @staticmethod
     def exportDefaultCfg(cfg_name: str) -> Config:
@@ -912,31 +941,123 @@ class Client:
         cfg.setConfig('use_pickle', False)
         return cfg
 
-    def stopClient(self) -> None:
-        for _q in self._sendqlist:
-            _q.put(MsgBag(['CMD'], 'CLOSE'))
+    @staticmethod
+    def _serveconnect(addr: _Tuple[str, int], inputq: Queue, outputq: Queue, usepk: bool, corek: int, 
+                      klen: int, ipv6: bool, encoder: _Any, vertiq: Queue, clid: str, stop_flg, stop_lock) -> None:
+        recv_connect = None
+        send_connect = None
+        if not ipv6:
+            recv_sock = _socket(AF_INET, SOCK_STREAM)
+            send_sock = _socket(AF_INET, SOCK_STREAM)
+        else:
+            recv_sock = _socket(AF_INET6, SOCK_STREAM)
+            send_sock = _socket(AF_INET6, SOCK_STREAM)
+        simplev = _SV(corek, klen)
 
-    def connect(self, addr: _Tuple[str, int], side: _Literal['recv', 'send']) -> _Union[ClientPort, None]:
-        sock = _socket(AF_INET, SOCK_STREAM)
-        connect = Connection(sock, side, encoder = self._coder, pk = self._usepk)
-        sock.settimeout(5.0)
-        sock.connect(addr)
-        sock.sendall(_SV(self._corekey, self._keylen).generateBytes())
-        connect.vertify(False, self._vertiq)
-        res: MsgBag = self._vertiq.get(True, 2.0)
-        if res.checkTag('VERTIFIED'):
-            if side == 'send':
-                inputq = Queue()
-                connect.work(inputq, bkQ = outputq, work_mode = 'thread')
-                self._connect_map[res.navigate] = connect
-                self._sendqlist.append(inputq)
-                return ClientPort(res.navigate, inputq)
-            elif side == 'recv':
-                outputq = Queue()
-                connect.work(outputq, work_mode = 'thread')
-                self._connect_map[res.navigate] = connect
-                self._recvqlist.append(outputq)
-                return ClientPort(res.navigate, outputq)
-        else: return None
-# Process do all the work &
-# make it static
+        recv_sock.connect(addr)
+        recv_sock.sendall(simplev.generateBytes())
+        recv_connect = Connection(recv_sock, 'recv', encoder = encoder, pk = usepk)
+        recv_connect.vertify(False, outputq)
+        try: recv_res: MsgBag = outputq.get(True, 2.0)
+        except Exception:
+            vertiq.put(MsgBag(['FAILED'], clid))
+            return
+        else:
+            if recv_res.checkTag('VERTIFIED'):
+                vertiq.put(MsgBag(['VRECV'], clid))
+            elif recv_res.checkTag('CLOSED'):
+                vertiq.put(MsgBag(['FAILED'], clid))
+                return 
+        del recv_res
+
+        send_sock.connect(addr)
+        send_sock.sendall(simplev.generateBytes())
+        send_connect = Connection(send_sock, 'send', encoder = encoder, pk = usepk)
+        send_connect.vertify(False, outputq)
+        try: send_res: MsgBag = outputq.get(True, 2.0)
+        except Exception:
+            vertiq.put(MsgBag(['FAILED'], clid))
+            return
+        else:
+            if send_res.checkTag('VERTIFIED'):
+                vertiq.put(MsgBag(['VSEND'], clid))
+            elif send_res.checkTag('CLOSED'):
+                vertiq.put(MsgBag(['FAILED'], clid))
+                return 
+        del send_res
+
+        send_connect.work(inputq, outputq)
+        recv_connect.work(outputq)
+
+        while True:
+            with stop_lock:
+                if not stop_flg.value:
+                    send_connect.stopWork()
+                    recv_connect.stopWork()
+                    vertiq.put(MsgBag(['STOPPED'], clid))
+                    break
+            _slp(0.2)
+
+    def _vertiservice(self, _logger: _LogW) -> None:
+        _logger.info('Start auth service.')
+        while True:
+            with self._run_lock:
+                if not self._running:
+                    _logger.warn('Stop auth thread!')
+                    break
+            try: vbag: MsgBag = self._vertiq.get(True, 2.0)
+            except Empty: pass
+            else:
+                if vbag.checkTag('FAILED'):
+                    _logger.error('Connection', vbag.getValue(), 'failed to verify.')
+                    with self._data_lock:
+                        self._clid_list.remove(vbag.getValue())
+                        self._inputqs.pop(vbag.getValue())
+                        self._outputqs.pop(vbag.getValue())
+                        self._serve_cons.pop(vbag.getValue())
+                        self._stopflgs.pop(vbag.getValue())
+                        self._stoplocks.pop(vbag.getValue())
+                        self._wrappers[vbag.getValue()].setStatus('DIED')
+                elif vbag.checkTag('VSEND'):
+                    _logger.info('Connection', vbag.getValue(), 'sending tunnel verified.')
+                    with self._data_lock: self._wrappers[vbag.getValue()].setStatus('NORM')
+                elif vbag.checkTag('VRECV'):
+                    _logger.info('Connection', vbag.getValue(), 'recving tunnel verified.')
+                    with self._data_lock: self._wrappers[vbag.getValue()].setStatus('NORM')
+
+    def stopClient(self) -> None:
+        self._logger.warn('Stopping Client!')
+        with self._run_lock: self._running = False
+        with self._data_lock:
+            for clid in self._clid_list:
+                with self._stoplocks[clid]:
+                    self._stopflgs[clid].value = False
+
+    def startClient(self) -> None:
+        with self._run_lock: self._running = True
+        self._verti_thread = _Thread(target = self._vertiservice, args = (self._logger.getWrapperInstance('auth'), ))
+        self._verti_thread.start()
+
+    def connectService(self, server_addr: _Tuple[str, int], target_service: str, client_id: str) -> _Union[ClientPort, None]:
+        if client_id in self._clid_list:
+            self._logger.error('Client ID already exists, change it and try again!')
+            return None
+        inputq = Queue()
+        outputq = Queue()
+        self._logger.info('Add connection:', client_id, '->', target_service)
+        with self._data_lock:
+            self._clid_list.append(client_id)
+            self._inputqs[client_id] = inputq
+            self._outputqs[client_id] = outputq
+            cs_flg = Value('b', True, lock = False)
+            cs_lock = _PLock()
+            self._stoplocks[client_id] = cs_lock
+            self._stopflgs[client_id] = cs_flg
+            cs_process = Process(target = Client._serveconnect, args = (server_addr, inputq, outputq, self._usepk, self._corekey,
+                                                                        self._keylen, self._ipv6, self._coder, self._vertiq, client_id,
+                                                                        cs_flg, cs_lock))
+            self._serve_cons[client_id] = cs_process
+            cs_port = ClientPort(target_service, inputq, outputq)
+            self._wrappers[client_id] = cs_port
+        cs_process.start()
+        return cs_port
