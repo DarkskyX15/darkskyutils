@@ -350,7 +350,6 @@ class Connection:
 
     def _work_as_recv(self) -> None:
         self._socket.settimeout(8.0)
-        self._socket.setblocking(1)
         while True:
             with self._work_lock:
                 if not self._working_flg:
@@ -814,12 +813,22 @@ class SocketHub:
 
 
 class ServicePort:
-    def __init__(self, service_name: str, msgq: Queue) -> None:
+    def __init__(self, service_name: str, inputq: Queue, outputq: Queue) -> None:
         self._name = service_name
-        self._msgq = msgq
-    
-    def putMsg(self, tags: _List[str], val: _Any, target_sid: int) -> None:
-        self._msgq.put(MsgBag(tags, [self._name, val], sys_sign = 'apps', navigate = target_sid))
+        self._inputq = inputq
+        self._outputq = outputq
+
+    def getIO(self) -> _Tuple[Queue, Queue]:
+        return self._inputq, self._outputq
+
+    def getMsg(self, _timeout: float = None) -> MsgBag:
+        if _timeout != None: return self._outputq.get(True, _timeout)
+        else: return self._outputq.get()
+
+    def putMsg(self, tags: _List[str], val: _Any, target_sid: int, _timeout: float = None) -> None:
+        if _timeout != None:
+            self._inputq.put(MsgBag(tags, [self._name, val], sys_sign = 'apps', navigate = target_sid), True, _timeout)
+        else: self._inputq.put(MsgBag(tags, [self._name, val], sys_sign = 'apps', navigate = target_sid))
 
 class Server:
     def __init__(self, sh_cfg: Config, plogger: _PL, encoder: _Any = AESCoder) -> None:
@@ -859,12 +868,16 @@ class Server:
                             self._service_map[ser].put(MsgBag(['STOP'], None, sys_sign = 'server'))
                     break
     
-    def bindService(self, name: str, msgq: Queue) -> ServicePort:
+    def bindService(self, name: str) -> _Union[ServicePort, None]:
+        if name in self._serve_name:
+            self._slg.error(f'Service {name} already exists, change one and try again!')
+            return None
         self._slg.info('Bind service:', name)
+        outpq = Queue()
         with self._service_lock:
-            self._service_map[name] = msgq
+            self._service_map[name] = outpq
             self._serve_name.append(name)
-        return ServicePort(name, self._inputq)
+        return ServicePort(name, self._inputq, outpq)
 
     def stopServer(self) -> None:
         self._slg.warn('Actively close server!')
@@ -889,6 +902,9 @@ class ClientPort:
         self._lock = _PLock()
         self._status = Value('b', False, lock = False)
     
+    def getIO(self) -> _Tuple[Queue, Queue]:
+        return self._inputq, self._outputq
+
     def setStatus(self, _sta: _Literal['NORM', 'DIED']) -> None:
         if _sta == 'NORM':
             with self._lock: self._status.value = True
@@ -1040,7 +1056,7 @@ class Client:
 
     def connectService(self, server_addr: _Tuple[str, int], target_service: str, client_id: str) -> _Union[ClientPort, None]:
         if client_id in self._clid_list:
-            self._logger.error('Client ID already exists, change it and try again!')
+            self._logger.error(f'Client {client_id} already exists, change it and try again!')
             return None
         inputq = Queue()
         outputq = Queue()
