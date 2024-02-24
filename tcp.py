@@ -585,7 +585,8 @@ class SocketCell:
                 else:
                     if msgb.sys_sign == 'sockend':
                         if msgb.checkTag('C_CLOSE'): info = 'client-side close'
-                        elif msgb.checkTag('ERR'): info = 'error & closed'
+                        elif msgb.checkTag('ERR'): info = 'error / timeout'
+                        elif msgb.checkTag('S_CLOSE'): info = 'forced close'
                         with _connect_lock:
                             _msgq_map.pop(msgb.navigate, None)
                             _connect_map.pop(msgb.navigate, None)
@@ -598,6 +599,7 @@ class SocketCell:
                                 if _rate_map[msgb.navigate] > _maxrate:
                                     _downlg.warn('Socket sending too many packets, ID:', msgb.navigate)
                                     _connect_map[msgb.navigate].stopWork()
+                                    _rate_map[msgb.navigate] = 0
                                 if _pfcnt() - _rate_time_map[msgb.navigate] > 1.0:
                                     _rate_map[msgb.navigate] = 0
                                 _rate_time_map[msgb.navigate] = _pfcnt()
@@ -905,6 +907,9 @@ class ClientPort:
     
     def getIO(self) -> _Tuple[Queue, Queue]:
         return self._inputq, self._outputq
+
+    def register(self) -> None:
+        pass
 
     def setStatus(self, _sta: _Literal['NORM', 'DIED']) -> None:
         if _sta == 'NORM':
