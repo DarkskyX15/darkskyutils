@@ -372,7 +372,7 @@ class Connection:
                         self._workq.put(MsgBag(['C_CLOSE'], None, sys_sign = 'sockend', navigate = self._sid))
                         break
                 elif isinstance(msg, list):
-                    self._workq.put(MsgBag([self._sign, msg[0]], msg[1], sys_sign = 'apps', navigate = self._sid))
+                    self._workq.put(MsgBag([msg[0]], msg[1], sys_sign = 'apps', navigate = self._sid))
 
     def _work_as_send(self) -> None:
         self._socket.settimeout(5.0)
@@ -538,6 +538,8 @@ class SocketCell:
         _msgq_map: _Dict[int, ThreadQueue] = {}
         _rate_map: _Dict[int, int] = {}
         _rate_time_map: _Dict[int, float] = {}
+        _try_registered: _Dict[int, bool] = {}
+        _try_reged: _Dict[int, bool] = {}
         _recvq = ThreadQueue()
         _downlock = _Lock()
         _vertilock = _Lock()
@@ -603,7 +605,19 @@ class SocketCell:
                                 if _pfcnt() - _rate_time_map[msgb.navigate] > 1.0:
                                     _rate_map[msgb.navigate] = 0
                                 _rate_time_map[msgb.navigate] = _pfcnt()
-                        _hubq.put(msgb)
+                        if msgb.checkTag('REGISTER'):
+                            if _try_registered.get(msgb.navigate, False): pass
+                            else:
+                                _downlg.info(f'Socket {msgb.navigate} request registery.')
+                                _try_registered[msgb.navigate] = True
+                                _hubq.put(msgb)
+                        elif msgb.checkTag('REGED'):
+                            if _try_reged.get(msgb.navigate, False): pass
+                            else:
+                                _try_reged[msgb.navigate] = True
+                                _hubq.put(msgb)
+                        else:
+                            _hubq.put(msgb)
 
         with _downlock: _downflg = True
         with _vertilock: _vertiflg = True
@@ -688,11 +702,15 @@ class SocketHub:
         self._key_len: int = cfg.queryConfig('keylen')
         self._use_ipv6: bool = cfg.queryConfig('ipv6')
         self._use_pickle: bool = cfg.queryConfig('use_pickle')
+        self._registered: _Dict[int, int] = {}
+        self._regkeys: _Dict[int, str] = {}
+        self._reg_lock = _Lock()
         self._logger: _LogW = logger
         self._logL: _List[_LogW] = logL
         self._logCT: _List[_LogW] = [logger.getWrapperInstance('CTunnel{}'.format(index)) for index in range(len(self._bind_addresses))]
         self._sid_iter = 0
         self._encoder = encoder
+        self._rs = _RS(64)
         self._fwlg = logger.getWrapperInstance('forwardloop')
         self._rvlg = logger.getWrapperInstance('reverseloop')
         self._mnlg = logger.getWrapperInstance('mainloop')
@@ -719,8 +737,13 @@ class SocketHub:
             try: mbag: MsgBag = self._inputq.get(True, 2.0)
             except Empty: pass
             else:
+                with self._reg_lock:
+                    if mbag.checkTag('REDIRECT'):
+                        if self._registered.get(mbag.navigate, -1) != -1:
+                            mbag.navigate = self._registered[mbag.navigate]
                 with self._alive_lock:
-                    self._cellqs[self._sid_cid_map[mbag.navigate]].put(mbag)
+                    if self._sid_cid_map.get(mbag.navigate, -1) != -1:
+                        self._cellqs[self._sid_cid_map[mbag.navigate]].put(mbag)
 
     def _distributeloop(self) -> None:
         while True:
@@ -737,7 +760,22 @@ class SocketHub:
                         self._alive_list[self._sid_cid_map[mbag.getValue()]] -= 1
                         self._sid_cid_map.pop(mbag.getValue())
                 elif mbag.sys_sign == 'apps':
-                    self._outputq.put(mbag)
+                    if mbag.checkTag('REGISTER'):
+                        rstr = self._rs.exportStr()
+                        self._regkeys[mbag.navigate] = rstr
+                        self._rs.regenerateStr()
+                        ret_data: _List = mbag.getValue()[:]
+                        self._rvlg.info(f'SID pair {ret_data} try register with key: {rstr}')
+                        ret_data.append(rstr)
+                        self._inputq.put(MsgBag(['REGISTER'], ['REGISTER', ret_data], navigate = mbag.getValue()[1], sys_sign = 'apps'))
+                    elif mbag.checkTag('REGED'):
+                        if self._regkeys[mbag.navigate] == mbag.getValue()[1]:
+                            self._rvlg.info(f'SID {mbag.navigate} registered with recv SID {mbag.getValue()[0]}.')
+                            with self._reg_lock: self._registered[mbag.navigate] = mbag.getValue()[0]
+                    else:
+                        with self._reg_lock:
+                            if self._registered.get(mbag.navigate, -1) != -1:
+                                self._outputq.put(mbag)
 
     def _hubloop(self) -> None:
         sock_queue = ThreadQueue()
@@ -828,7 +866,8 @@ class ServicePort:
         if _timeout != None: return self._outputq.get(True, _timeout)
         else: return self._outputq.get()
 
-    def putMsg(self, tags: _List[str], val: _Any, target_sid: int, _timeout: float = None) -> None:
+    def putMsg(self, tags: _List[str], val: _Any, target_sid: int, _timeout: float = None, redirect: bool = True) -> None:
+        if redirect: tags.append('REDIRECT')
         if _timeout != None:
             self._inputq.put(MsgBag(tags, [self._name, val], sys_sign = 'apps', navigate = target_sid), True, _timeout)
         else: self._inputq.put(MsgBag(tags, [self._name, val], sys_sign = 'apps', navigate = target_sid))
@@ -898,18 +937,26 @@ class Server:
 
 
 class ClientPort:
-    def __init__(self, service: str, inputq: Queue, outputq: Queue) -> None:
-        self._service = service
+    def __init__(self, inputq: Queue, outputq: Queue, sid_pair: _Tuple[int, int]) -> None:
         self._inputq = inputq
         self._outputq = outputq
         self._lock = _PLock()
         self._status = Value('b', True, lock = False)
+        self._send_sid = sid_pair[0]
+        self._recv_sid = sid_pair[1]
     
     def getIO(self) -> _Tuple[Queue, Queue]:
         return self._inputq, self._outputq
 
     def register(self) -> None:
-        pass
+        self._inputq.put(MsgBag([], ['REGISTER', [self._send_sid, self._recv_sid]]))
+        regbag: MsgBag = self._outputq.get()
+        if regbag.checkTag('REGISTER'):
+            reg_data = regbag.getValue()
+            if reg_data[0] == self._send_sid and reg_data[1] == self._recv_sid:
+                self._inputq.put(MsgBag([], ['REGED', [self._recv_sid, reg_data[2]]]))
+            else: return None
+        else: return None
 
     def setStatus(self, _sta: _Literal['NORM', 'DIED']) -> None:
         if _sta == 'NORM':
@@ -924,13 +971,13 @@ class ClientPort:
                 if _timeout != None: return self._outputq.get(True, timeout = _timeout)
                 else: return self._outputq.get()
 
-    def putMsg(self, val: _Any, _timeout: float = None) -> bool:
+    def putMsg(self, val: _Any, target_service: str, _timeout: float = None) -> bool:
         with self._lock:
             if not self._status.value: return False
             else:
                 if _timeout != None:
-                    self._inputq.put(MsgBag([], [self._service, val]), True, _timeout)
-                else: self._inputq.put(MsgBag([], [self._service, val]))
+                    self._inputq.put(MsgBag([], [target_service, val]), True, _timeout)
+                else: self._inputq.put(MsgBag([], [target_service, val]))
                 return True
 
 class Client:
@@ -950,6 +997,7 @@ class Client:
         self._stoplocks: _Dict[str, _Any] = {}
         self._vertiq = Queue()
         self._verti_thread = None
+        self._sidretq = ThreadQueue()
         self._running = False
         self._run_lock = _Lock()
         self._logger = plogger.getWarpperInstance('Client')
@@ -1008,6 +1056,7 @@ class Client:
                 return 
         del send_res
 
+        vertiq.put(MsgBag(['VERIFIED'], (send_connect._sid, recv_connect._sid)))
         send_connect.work(inputq, outputq)
         recv_connect.work(outputq)
 
@@ -1044,6 +1093,9 @@ class Client:
                     _logger.info('Connection', vbag.getValue(), 'sending tunnel verified.')
                 elif vbag.checkTag('VRECV'):
                     _logger.info('Connection', vbag.getValue(), 'recving tunnel verified.')
+                elif vbag.checkTag('VERIFIED'):
+                    _logger.info('Verified SID:', vbag.getValue())
+                    self._sidretq.put(vbag.getValue())
 
     def stopClient(self) -> None:
         self._logger.warn('Stopping Client!')
@@ -1058,26 +1110,28 @@ class Client:
         self._verti_thread = _Thread(target = self._vertiservice, args = (self._logger.getWrapperInstance('auth'), ))
         self._verti_thread.start()
 
-    def connectService(self, server_addr: _Tuple[str, int], target_service: str, client_id: str) -> _Union[ClientPort, None]:
+    def connectServer(self, server_addr: _Tuple[str, int], client_id: str) -> _Union[ClientPort, None]:
         if client_id in self._clid_list:
             self._logger.error(f'Client {client_id} already exists, change it and try again!')
             return None
         inputq = Queue()
         outputq = Queue()
-        self._logger.info('Add connection:', client_id, '->', target_service)
+        self._logger.info('Add connection:', client_id, '->', server_addr)
+        cs_flg = Value('b', True, lock = False)
+        cs_lock = _PLock()
+        cs_process = Process(target = Client._serveconnect, args = (server_addr, inputq, outputq, self._usepk, self._corekey,
+                                                                    self._keylen, self._ipv6, self._coder, self._vertiq, client_id,
+                                                                    cs_flg, cs_lock))
+        cs_process.start()
+        sid_pair = self._sidretq.get()
         with self._data_lock:
             self._clid_list.append(client_id)
             self._inputqs[client_id] = inputq
             self._outputqs[client_id] = outputq
-            cs_flg = Value('b', True, lock = False)
-            cs_lock = _PLock()
             self._stoplocks[client_id] = cs_lock
             self._stopflgs[client_id] = cs_flg
-            cs_process = Process(target = Client._serveconnect, args = (server_addr, inputq, outputq, self._usepk, self._corekey,
-                                                                        self._keylen, self._ipv6, self._coder, self._vertiq, client_id,
-                                                                        cs_flg, cs_lock))
             self._serve_cons[client_id] = cs_process
-            cs_port = ClientPort(target_service, inputq, outputq)
+            cs_port = ClientPort(inputq, outputq, sid_pair)
+            self._logger.info('Create ClientPort instance')
             self._wrappers[client_id] = cs_port
-        cs_process.start()
         return cs_port
