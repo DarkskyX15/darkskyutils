@@ -4,9 +4,9 @@ from pickle import loads as _ploads, dumps as _pdumps
 from time import sleep as _slp, perf_counter as _pfcnt
 from typing import Literal as _Literal, Any as _Any, Union as _Union, Tuple as _Tuple, List as _List, Dict as _Dict
 from json import dumps as _dumps, loads as _loads
-from sky_lib.encrypt import AES as _AES, RSA as _RSA, RSAKeyPair as _KeyPair, SimpleVertify as _SV, RandomStr as _RS
-from sky_lib.logger import LoggerWrapper as _LogW, ProcessLogger as _PL
-from sky_lib.config import Config
+from skylib.encrypt import AES as _AES, RSA as _RSA, RSAKeyPair as _KeyPair, SimpleVertify as _SV, RandomStr as _RS
+from skylib.logger import LoggerWrapper as _LogW, ProcessLogger as _PL
+from skylib.config import Config
 from socket import socket as _socket, AF_INET, AF_INET6, SOCK_STREAM
 from base64 import b64decode as _b64de, b64encode as _b64en
 from multiprocessing import Process, Queue, Value, Lock as _PLock
