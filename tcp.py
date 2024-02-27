@@ -876,9 +876,9 @@ class Server:
     def __init__(self, sh_cfg: Config, plogger: _PL, encoder: _Any = AESCoder) -> None:
         _cell_cnt = sh_cfg.queryConfig('maxcell')
         self._logger = plogger
-        self._slg = self._logger.getWarpperInstance('Server')
-        self._shlog = self._logger.getWarpperInstance('HUB')
-        self._logwl = [self._logger.getWarpperInstance('CELL{}'.format(index)) for index in range(_cell_cnt)]
+        self._slg = self._logger.getWrapperInstance('Server')
+        self._shlog = self._logger.getWrapperInstance('HUB')
+        self._logwl = [self._logger.getWrapperInstance('CELL{}'.format(index)) for index in range(_cell_cnt)]
         self._sh = SocketHub(sh_cfg, self._shlog, self._logwl, encoder)
         self._dist_thread = None
         self._service_map: _Dict[str, Queue] = {}
@@ -1000,7 +1000,7 @@ class Client:
         self._sidretq = ThreadQueue()
         self._running = False
         self._run_lock = _Lock()
-        self._logger = plogger.getWarpperInstance('Client')
+        self._logger = plogger.getWrapperInstance('Client')
     
     @staticmethod
     def exportDefaultCfg(cfg_name: str) -> Config:

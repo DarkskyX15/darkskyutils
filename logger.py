@@ -164,7 +164,7 @@ class ProcessLogger:
     def changeWrapper(self, wrapper: _Callable) -> None:
         self.wrapper = wrapper
 
-    def getWarpperInstance(self, phase_name: str) -> LoggerWrapper:
+    def getWrapperInstance(self, phase_name: str) -> LoggerWrapper:
         return self.wrapper(phase_name, self.logs_queue)
     
 class ThreadLogger:
@@ -217,5 +217,5 @@ class ThreadLogger:
     def changeWrapper(self, wrapper: _Callable) -> None:
         self.wrapper = wrapper
 
-    def getWarpperInstance(self, phase_name: str) -> LoggerWrapper:
+    def getWrapperInstance(self, phase_name: str) -> LoggerWrapper:
         return self.wrapper(phase_name, self.logs_queue)
