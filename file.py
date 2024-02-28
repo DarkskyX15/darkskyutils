@@ -122,7 +122,7 @@ def doFileSelect(file_with_attr: _List[_Tuple], filter: _Callable = None) -> _Tu
         else: falses.append(obj)
     return trues, falses
     
-def getMaxFile(path_list: list[str]) -> int:
+def getMaxFile(path_list: _List[str]) -> int:
     """取`path_list`中所有路径对应文件的最大文件, 返回一个元组`(最大文件大小, 最大文件路径)`"""
     max_size = -1
     max_file_path = ''
