@@ -118,6 +118,7 @@ class ProcessLogger:
     进阶用法查看`LoggerWrapper`类的说明.
     '''
     def __init__(self, file_output: bool = False, logs_folder_name: str = None) -> None:
+        self._color_output = True
         self.logs_queue = _Queue()
         self.logger_thread = None
         self.logs_folder = '.\\Logs' if logs_folder_name == None else logs_folder_name.removesuffix('\\')
@@ -131,6 +132,9 @@ class ProcessLogger:
             if not _exists(self.logs_folder):
                 _mkdir(self.logs_folder)
             self.log_file_name = _strftime('%Y-%m-%d_%H-%M-%S_', _localtime()) + str(_randint(10000, 99999)) + '.log'
+
+    def disableColorOutput(self) -> None:
+        self._color_output = False
 
     def _work(self) -> None:
         if self.file_output:
@@ -148,9 +152,10 @@ class ProcessLogger:
 
             if self.file_output: file_out.write(text + '\n')
             color_id = packet.getColorPrefix()
-            if color_id != None:
-                text = '\033[0;{}m'.format(color_id) + text
-            text += '\033[m'
+            if self._color_output:
+                if color_id != None:
+                    text = '\033[0;{}m'.format(color_id) + text
+                text += '\033[m'
             print(text, flush = True)
 
             if packet.level == 'STOP':
@@ -171,6 +176,7 @@ class ThreadLogger:
     '''`ThreadLogger`与`ProcessLogger`在使用上完全一致, 但是`ThreadLogger`在另一线程上运行, 而`ProcessLogger`在另一进程上运行'''
 
     def __init__(self, file_output: bool = False, logs_folder_name: str = None) -> None:
+        self._color_output = True
         self.logs_queue = _Queue()
         self.logger_thread = None
         self.logs_folder = '.\\Logs' if logs_folder_name == None else logs_folder_name.removesuffix('\\')
@@ -201,9 +207,10 @@ class ThreadLogger:
 
             if self.file_output: file_out.write(text + '\n')
             color_id = packet.getColorPrefix()
-            if color_id != None:
-                text = '\033[0;{}m'.format(color_id) + text
-            text += '\033[m'
+            if self._color_output:
+                if color_id != None:
+                    text = '\033[0;{}m'.format(color_id) + text
+                text += '\033[m'
             print(text, flush = True)
 
             if packet.level == 'STOP':
@@ -213,6 +220,9 @@ class ThreadLogger:
     def startLogThread(self) -> None:
         self.logger_thread = _Thread(target = self._work)
         self.logger_thread.start()
+
+    def disableColorOutput(self) -> None:
+        self._color_output = False
 
     def changeWrapper(self, wrapper: _Callable) -> None:
         self.wrapper = wrapper
