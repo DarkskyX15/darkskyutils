@@ -1,7 +1,7 @@
 # -*- coding: UTF-8 -*-
 import typing, importlib, os, keyboard, win32gui, time
-from skyutils.sky_graph.widget import BaseWidget
-from skyutils.sky_graph.graphic import COORD, goToXY
+from darkskyutils.sky_graph.widget import BaseWidget
+from darkskyutils.sky_graph.graphic import COORD, goToXY
 
 
 class BaseScene:

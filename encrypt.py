@@ -12,7 +12,7 @@ from Crypto.Cipher import PKCS1_v1_5 as _PKCS1
 from Crypto import Random as _Random
 from random import randint as _randint
 from typing import Literal as _Literal, Any as _Any, Union as _Union, Dict as _Dict, Tuple as _Tuple, List as _List
-from skyutils.logger import LoggerWrapper as _LogW
+from darkskyutils.logger import LoggerWrapper as _LogW
 
 
 class KeyPairError(Exception):

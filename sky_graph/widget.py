@@ -1,6 +1,6 @@
 # -*- coding: UTF-8 -*-
 import typing
-from skylib.sky_graph.graphic import BaseOption, COORD, TextComponent, ComplexText, VariableText, goToXY, mixedStrLength
+from darkskyutils.sky_graph.graphic import BaseOption, COORD, TextComponent, ComplexText, VariableText, goToXY, mixedStrLength
 
 
 class BaseWidget:
