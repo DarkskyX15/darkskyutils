@@ -127,6 +127,8 @@ class SimpleVertify:
         ckey = self.core_key
         for _ in range(self.b_size - 1):
             rint = _randint(0, 255)
+            while rint == self.core_key:
+                rint = _randint(0, 255)
             ckey ^= rint
             rint_l.append(rint)
         rint_l.append(ckey)
@@ -136,6 +138,7 @@ class SimpleVertify:
         if len(vbytes) != self.b_size: return False
         ckey = vbytes[-1]
         for index in range(self.b_size - 2, -1, -1):
+            if vbytes[index] == self.core_key: return False
             ckey ^= vbytes[index]
         return (ckey == self.core_key)
 
