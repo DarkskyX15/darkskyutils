@@ -10,10 +10,17 @@ from Crypto.Util.Padding import unpad as _unpad
 from Crypto.PublicKey import RSA as _RSA
 from Crypto.Cipher import PKCS1_v1_5 as _PKCS1
 from Crypto import Random as _Random
-from random import randint as _randint
+from random import randint as _randint_usf
+from os import urandom as _urand
+from sys import byteorder as _bo
 from typing import Literal as _Literal, Any as _Any, Union as _Union, Dict as _Dict, Tuple as _Tuple, List as _List
 from darkskyutils.logger import LoggerWrapper as _LogW
 
+def _randint(_lfb: int = 0, _rtb: int = 255) -> None:
+    if _lfb > _rtb: _lfb, _rtb = _rtb, _lfb
+    if _lfb < 0: _lfb = 0
+    if _rtb > 255: _rtb = 255
+    return (int.from_bytes(_urand(1), _bo) % (_rtb - _lfb)) + _lfb
 
 class KeyPairError(Exception):
     def __init__(self, *args: object) -> None:
@@ -50,7 +57,7 @@ class CLikeRandom:
     - `seed`: 指定随机数种子, 应为正整数, 相同随机数种子生成的随机数序列相同.
     未指定时随机生成'''
     def __init__(self, seed: int = None) -> None:
-        if seed == None: self.seed = _randint(0, 32767)
+        if seed == None: self.seed = _randint_usf(0, 32767)
         else: self.seed = seed
         self.t_rand = seed
     
@@ -72,7 +79,7 @@ class RandomStr:
 
     可以通过`regenerateStr`方法用新的`seed`重新生成字符串
 
-    若未指定`seed`则使用`random.randint`生成随机字符串, 否则使用类 C/C++ 的`rand`方法生成随机字符串'''
+    若未指定`seed`则使用`os.urandom`生成随机字符串, 否则使用类 C/C++ 的`rand`方法生成随机字符串'''
     def __init__(self, length: int, seed: int = None) -> None:
         self.length = length
         self.seed = seed
